@@ -1,0 +1,16 @@
+# --- Core ---
+streamlit>=1.36.0
+pandas>=2.2.2
+numpy>=1.26.4
+scikit-learn>=1.5.0
+joblib>=1.4.2
+
+# --- Pose estimation backends ---
+ultralytics>=8.1.0      # YOLOv8-Pose
+mediapipe==0.10.14      # fallback CPU
+
+# --- Video processing ---
+opencv-python-headless>=4.9.0.80
+
+# --- Utilities ---
+matplotlib>=3.9.0
