@@ -3,9 +3,14 @@ __pycache__/
 .venv/
 .env
 .streamlit/secrets.toml
-artifacts/
+
+# Ignora contenido pesado pero permite los artefactos clave del modelo
+artifacts/*
+!artifacts/complete_model_thresholded_bundle.joblib
+!artifacts/complete_feature_cols.csv
+!artifacts/complete_label_names.csv
+
 data/
 videos/
-!artifacts/.gitkeep
 !data/demo/.gitkeep
 .DS_Store
