@@ -281,6 +281,7 @@ with st.sidebar:
     else:
         conf = st.slider("Umbral de confianza", 0.1, 0.9, 0.5, 0.05)
         min_detection_confidence = st.slider("Confianza mínima de detección", 0.1, 0.9, 0.5, 0.05)
+        stride = 1  # Valor por defecto para MediaPipe
     
     st.markdown("---")
     st.markdown("### 🔍 Opciones de visualización")
