@@ -1,10 +1,11 @@
 # ============================================================
-# app.py — Asistente Coreográfico Inteligente (Producción)
+# app.py — Asistente Coreográfico Inteligente (Robusto)
 # ============================================================
 
 import os
 import io
 import json
+import glob
 import tempfile
 import traceback
 import numpy as np
@@ -105,6 +106,16 @@ def extract_frames(video_path, num_frames=6):
 
 ART_DIR = os.environ.get("ARTIFACTS_DIR", "artifacts")
 
+# Diagnóstico de archivos en sidebar
+with st.sidebar.expander("🧪 Diagnóstico de archivos", expanded=False):
+    st.write("CWD:", os.getcwd())
+    try:
+        st.write("Contenido raíz:", os.listdir("."))
+    except Exception:
+        st.write("No se pudo listar raíz.")
+    st.write("Contenido /artifacts:", os.listdir("artifacts") if os.path.exists("artifacts") else "NO existe")
+    st.write("Joblib encontrados:", glob.glob("**/*.joblib", recursive=True))
+
 from src.model_io import load_bundle, ensure_feature_frame
 from src.inference import run_inference_over_video
 from src.features import features_coreograficos
@@ -117,7 +128,7 @@ try:
     FEATURE_COLS = BUNDLE["feature_cols"]
     LABEL_NAMES = BUNDLE["label_names"]
 except Exception as e:
-    st.error("No se pudo cargar el bundle del modelo entrenado desde 'artifacts/'.")
+    st.error(f"No se pudo cargar el bundle del modelo entrenado desde '{ART_DIR}/'.\n\nDetalles: {e}")
     st.stop()
 
 # Estado
@@ -148,9 +159,19 @@ with st.sidebar:
     )
     conf = st.slider("Umbral de confianza (si aplica)", 0.1, 0.9, 0.5, 0.05)
     stride = st.number_input("Stride (procesar 1 de cada N frames)", min_value=1, max_value=10, value=2, step=1)
+
     st.markdown("---")
     show_keypoints = st.checkbox("Mostrar anotación de puntos en algunos frames", value=True)
     num_frames = st.slider("Frames a mostrar", 3, 12, 6)
+
+    st.markdown("---")
+    # Consejo solicitado (visible en la UI)
+    st.info(
+        "💡 Consejo:\n\n"
+        "• Si usas **YOLO** con *stride* alto y el bailarín sale pequeño o hay poco contraste, "
+        "puede quedarse sin detecciones. Prueba **stride = 1–2** y **conf ≈ 0.3–0.5**.\n"
+        "• Con **MediaPipe**, asegúrate de un vídeo con **cuerpo completo** y **buena luz**."
+    )
 
 # ============================================================
 # Tabs
@@ -194,7 +215,7 @@ with tab1:
                 pbar = st.progress(0)
                 msg = st.empty()
                 try:
-                    # 1) Keypoints de TODO el vídeo (stride y conf aplican si el backend lo soporta)
+                    # 1) Keypoints de TODO el vídeo
                     msg.markdown('<div class="analysis-progress">🔄 Extrayendo keypoints…</div>', unsafe_allow_html=True)
                     backbone = "yolo" if "YOLO" in model_option else "mediapipe"
                     keypoints, meta = run_inference_over_video(
@@ -205,25 +226,57 @@ with tab1:
                     )
                     pbar.progress(35)
 
-                    # 2) Features coreográficas
+                    # Diagnóstico runtime
+                    with st.sidebar.expander("🔎 Diagnóstico runtime", expanded=False):
+                        st.write("Backbone:", backbone)
+                        st.write("Stride:", int(stride), "Conf:", float(conf))
+                        st.write("Keypoints shape:", None if keypoints is None else getattr(keypoints, "shape", None))
+
+                    # 2) Features (siempre dict)
                     msg.markdown('<div class="analysis-progress">📊 Calculando métricas coreográficas…</div>', unsafe_allow_html=True)
-                    feats = features_coreograficos(keypoints, meta=meta)  # dict
+
+                    # Wrapper seguro por si el módulo features devuelve None
+                    def _safe_features(kp, meta):
+                        try:
+                            feats_local = features_coreograficos(kp, meta=meta)
+                            if not isinstance(feats_local, dict):
+                                return {
+                                    "amplitud_x": 0.0, "amplitud_y": 0.0, "amplitud_z": 0.0,
+                                    "velocidad_media": 0.0, "simetria": 0.0,
+                                    "nivel_rango": 0.0, "variedad_direcciones": 0.0
+                                }
+                            return feats_local
+                        except Exception:
+                            return {
+                                "amplitud_x": 0.0, "amplitud_y": 0.0, "amplitud_z": 0.0,
+                                "velocidad_media": 0.0, "simetria": 0.0,
+                                "nivel_rango": 0.0, "variedad_direcciones": 0.0
+                            }
+
+                    if keypoints is None or not hasattr(keypoints, "shape") or keypoints.size == 0 or keypoints.shape[0] == 0:
+                        st.warning("No se detectaron keypoints en el vídeo (iluminación, plano, stride alto o conf alta).")
+                        feats = _safe_features(np.zeros((0, 17, 3), dtype=float), meta=meta)
+                    else:
+                        feats = _safe_features(keypoints, meta=meta)
+
+                    with st.sidebar.expander("🔎 Métricas (preview)", expanded=False):
+                        st.write({k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in list(feats.items())[:6]})
+
                     pbar.progress(60)
 
-                    # 3) Predicción con tu pipeline entrenado (con umbrales)
+                    # 3) Inferencia con el pipeline entrenado (umbrales ya embebidos)
                     msg.markdown('<div class="analysis-progress">🧠 Inferencia del modelo entrenado…</div>', unsafe_allow_html=True)
                     X = ensure_feature_frame(feats, FEATURE_COLS)
-                    # Ojo: el pipeline del bundle ya incorpora el wrapper thresholded
                     yhat = PIPE.predict(X)[0]
-                    proba = None
                     try:
                         proba = PIPE.predict_proba(X)[0]
+                        proba_list = proba.tolist()
                     except Exception:
-                        pass
+                        proba_list = None
                     labels_on = [lbl for lbl, z in zip(LABEL_NAMES, yhat) if int(z) == 1]
                     pbar.progress(80)
 
-                    # 4) Sugerencias a partir de etiquetas activas
+                    # 4) Sugerencias
                     msg.markdown('<div class="analysis-progress">💡 Generando sugerencias…</div>', unsafe_allow_html=True)
                     suggestions = map_labels_to_suggestions(labels_on)
                     pbar.progress(95)
@@ -234,7 +287,7 @@ with tab1:
                     st.session_state.analysis_results = {
                         "feats": feats,
                         "labels_on": labels_on,
-                        "proba": proba.tolist() if proba is not None else None,
+                        "proba": proba_list,
                         "suggestions": suggestions,
                         "frames": frames,
                         "video_path": tmp_path,
