@@ -1,5 +1,5 @@
 # ============================================================
-# app.py — Asistente Coreográfico (réplica Colab: YOLO Pose → Features → Modelo)
+# app.py — Asistente Coreográfico (Colab-compat ▸ YOLO Pose → Features → Modelo)
 # ============================================================
 
 from __future__ import annotations
@@ -77,12 +77,8 @@ def _video_to_keypoints_yolo(video_path: str, weights_path: str, conf: float = 0
     except Exception as e:
         raise RuntimeError("Ultralytics no está instalado. Añade 'ultralytics torch torchvision' a requirements.") from e
 
-    # Prioriza pesos locales (entornos sin internet)
-    if os.path.exists(weights_path):
-        model = YOLO(weights_path)
-    else:
-        # Nombre "yolov8n-pose.pt" → autodescarga (requiere internet)
-        model = YOLO(weights_path)
+    # Pesos locales si están (entornos sin internet)
+    model = YOLO(weights_path)  # acepta path local o nombre ('yolov8n-pose.pt') con autodescarga
 
     cap = cv2.VideoCapture(video_path)
     assert cap.isOpened(), f"No se pudo abrir el vídeo: {video_path}"
@@ -126,8 +122,7 @@ def _interpolate_nan_1d(y: np.ndarray) -> np.ndarray:
     mask = np.isfinite(y)
     if mask.sum() == 0: return y
     if mask.sum() == 1: y[~mask] = y[mask][0]; return y
-    y[~mask] = np.interp(idx[~mask], idx[mask], y[mask])
-    return y
+    y[~mask] = np.interp(idx[~mask], idx[mask], y[mask]); return y
 
 def _clean_nan_interpolate(K: np.ndarray, min_valid_ratio: float = 0.10) -> Tuple[np.ndarray, List[int]]:
     if K is None or len(K) == 0: return K, []
@@ -174,6 +169,60 @@ def features_coreograficos(K: np.ndarray) -> Dict[str, float]:
         feats["variedad_direcciones"] = 0.0
     feats["frames"] = float(T)
     return feats
+
+# ======= Métricas temporales extra (para sugerencias avanzadas) =======
+def timeseries_metrics(K: Optional[np.ndarray]) -> Dict[str, float]:
+    M: Dict[str, float] = {}
+    if K is None or not np.isfinite(K).any():
+        return { "pause_ratio":0.0, "jerk_mean":0.0, "turn_rate":0.0,
+                 "expansion_var":0.0, "left_right_imbalance":0.0, "tempo_cv":0.0 }
+    COM = _center_of_mass(K)
+    disp = np.diff(COM, axis=0)
+    speed = np.linalg.norm(disp, axis=1) if disp.size else np.array([])
+    accel = np.diff(speed) if speed.size else np.array([])
+    jerk = np.diff(accel) if accel.size else np.array([])
+
+    M["pause_ratio"] = float(np.mean(speed < (np.nanmedian(speed)+1e-6)*0.15)) if speed.size else 0.0
+    M["jerk_mean"] = float(np.nanmean(np.abs(jerk))) if jerk.size else 0.0
+    if disp.size:
+        dirs = np.arctan2(disp[:,1], disp[:,0])
+        M["turn_rate"] = float(np.mean(np.abs(np.diff(dirs)) > 0.7))  # giros fuertes (>40°)
+        # regularidad de tempo (delta entre picos de velocidad)
+        try:
+            import numpy as _np
+            peaks = _np.where((speed[1:-1] > speed[:-2]) & (speed[1:-1] > speed[2:]))[0] + 1
+            if len(peaks) >= 3:
+                intervals = _np.diff(peaks)
+                M["tempo_cv"] = float(_np.std(intervals) / ( _np.mean(intervals) + 1e-8 ))
+            else:
+                M["tempo_cv"] = 1.0
+        except Exception:
+            M["tempo_cv"] = 1.0
+    else:
+        M["turn_rate"] = 0.0; M["tempo_cv"] = 1.0
+
+    # expansión corporal (área caja de keypoints por frame)
+    try:
+        areas = []
+        for t in range(K.shape[0]):
+            P = K[t]
+            if np.isfinite(P).any():
+                xs = P[:,0]; ys = P[:,1]
+                areas.append( (np.nanmax(xs)-np.nanmin(xs)) * (np.nanmax(ys)-np.nanmin(ys)) )
+        M["expansion_var"] = float(np.std(areas) / (np.mean(areas)+1e-8)) if areas else 0.0
+    except Exception:
+        M["expansion_var"] = 0.0
+
+    # desequilibrio izquierda-derecha (distancia promedio de pares simétricos)
+    pairs = [(5,6),(7,8),(9,10),(11,12),(13,14),(15,16)]
+    diffs = []
+    for a,b in pairs:
+        if a<K.shape[1] and b<K.shape[1]:
+            da = np.linalg.norm(K[:,a,:]-K[:,b,:], axis=1)
+            diffs.append(np.nanmean(da))
+    M["left_right_imbalance"] = float(np.std(diffs)) if diffs else 0.0
+
+    return M
 
 # ============================================================
 # Modelo (auto-detección; prioriza thresholded_bundle)
@@ -227,13 +276,14 @@ def _load_model_and_meta(artifacts_dir: str):
     if isinstance(th, dict): meta["thresholds"] = {str(k): float(v) for k, v in th.items() if isinstance(v,(int,float))}
     return model, meta, path
 
-def _vectorize(features: Dict[str,float], feature_order: Optional[List[str]]) -> np.ndarray:
+def _vectorize(features: Dict[str,float], feature_order: Optional[List[str]]) -> Tuple[np.ndarray, List[str]]:
     if feature_order:
         keys = list(feature_order)
     else:
         prefer = ['amplitud_x','amplitud_y','amplitud_z','velocidad_media','simetria','nivel_rango','variedad_direcciones','frames']
         keys = [k for k in prefer if k in features] + [k for k in sorted(features.keys()) if k not in prefer]
-    return np.array([[float(features.get(k,0.0)) for k in keys]], dtype=np.float64)
+    X = np.array([[float(features.get(k,0.0)) for k in keys]], dtype=np.float64)
+    return X, keys
 
 def _get_model_classes(model, meta: Dict[str,Any]) -> List[str]:
     if isinstance(meta.get("classes"), list) and meta["classes"]:
@@ -250,84 +300,209 @@ def _get_thresholds(classes: List[str], meta: Dict[str,Any], default: float=0.5)
             except Exception: pass
     return out
 
+def _proba_from_list(probs_list, n_classes: int) -> Optional[np.ndarray]:
+    """
+    Convierte predict_proba estilo multilabel (lista de (n,2)) -> (n, n_classes) con columna positiva.
+    """
+    try:
+        arrs = []
+        for p in probs_list:
+            p = np.asarray(p)
+            if p.ndim == 2 and p.shape[1] == 2:
+                arrs.append(p[:,1])   # prob de la clase positiva
+            elif p.ndim == 1:
+                arrs.append(p)        # ya es prob positiva
+            else:
+                # softmax por si acaso
+                e = np.exp(p - np.max(p, axis=-1, keepdims=True))
+                sm = e / (np.sum(e, axis=-1, keepdims=True) + 1e-8)
+                if sm.shape[1] >= 2: arrs.append(sm[:,1])
+                else: arrs.append(sm[:,0])
+        return np.stack(arrs, axis=1).reshape(1, n_classes)
+    except Exception:
+        return None
+
 def predict_with_model(features: Dict[str,float], artifacts_dir: str="artifacts"
 ) -> Tuple[List[str], List[float], Dict[str,float], Optional[str]]:
     model, meta, model_path = _load_model_and_meta(artifacts_dir)
     if model is None:
         raise RuntimeError("No se encontró un modelo en artifacts/ (p.ej., complete_model_thresholded_bundle.joblib).")
-    X = _vectorize(features, meta.get("feature_order"))
+
+    X, feat_keys = _vectorize(features, meta.get("feature_order"))
+    classes = _get_model_classes(model, meta)
+    nC = len(classes)
+
     probs = None
     try:
         est = model
         if hasattr(est,"predict_proba"):
-            probs = est.predict_proba(X)
-        elif hasattr(est,"decision_function"):
+            pr = est.predict_proba(X)
+            if isinstance(pr, list):
+                probs = _proba_from_list(pr, nC)
+            else:
+                pr = np.asarray(pr)
+                if pr.ndim == 2 and pr.shape[1] in (nC, 2):
+                    # binario → usar proba de clase positiva si hay 2
+                    probs = pr if pr.shape[1] == nC else pr[:,1:].reshape(1,1) if nC==1 else None
+                else:
+                    probs = pr.reshape(1, -1)
+        if probs is None and hasattr(est,"decision_function"):
             df = est.decision_function(X)
-            if isinstance(df,np.ndarray): probs = 1/(1+np.exp(-df))
-        elif hasattr(est,"predict"):
+            df = np.asarray(df)
+            if df.ndim == 1: df = df.reshape(1,-1)
+            # sigmoide para mapear a [0,1]
+            probs = 1/(1+np.exp(-df))
+        if probs is None and hasattr(est,"predict"):
             y = est.predict(X)
-            classes = _get_model_classes(model,meta)
-            probs = np.zeros((1,len(classes)),dtype=float)
-            try:
-                idx = int(y[0]); 
-                if 0<=idx<probs.shape[1]: probs[0,idx]=1.0
-            except Exception:
-                for i,c in enumerate(classes):
-                    if str(y[0])==str(c): probs[0,i]=1.0; break
+            y = np.asarray(y)
+            if y.ndim == 2 and y.shape[1] == nC:
+                # matriz 0/1 multilabel → úsala como probas
+                probs = y.astype(float)
+            else:
+                # binario o multiclase top-1
+                probs = np.zeros((1, nC), dtype=float)
+                try:
+                    idx = int(y[0]); 
+                    if 0<=idx<nC: probs[0, idx] = 1.0
+                except Exception:
+                    for i, c in enumerate(classes):
+                        if str(y[0]) == str(c): probs[0, i] = 1.0; break
     except Exception as e:
         st.error("No se pudieron obtener puntuaciones del modelo (comprueba versiones sklearn/joblib).")
         st.code("".join(traceback.format_exception_only(type(e), e)))
         probs = None
 
-    classes = _get_model_classes(model, meta)
-    if probs is not None and probs.ndim==1: probs = probs.reshape(1,-1)
-    prob_map: Dict[str,float] = {}
-    if probs is not None and probs.shape[1]==len(classes):
-        for i,c in enumerate(classes): prob_map[c] = float(probs[0,i])
+    # Normaliza forma
+    if probs is not None and probs.ndim == 1: probs = probs.reshape(1, -1)
+    # Arma prob_map aunque haya descuadres menores
+    prob_map: Dict[str, float] = {}
+    if probs is not None:
+        if probs.shape[1] != nC:
+            # Ajuste por si el modelo es binario sin classes_ bien formado
+            if probs.shape[1] == 1 and nC == 2:
+                prob_map[classes[1]] = float(probs[0,0])
+                prob_map[classes[0]] = float(1.0 - probs[0,0])
+            else:
+                # recorta o rellena
+                for i in range(min(nC, probs.shape[1])):
+                    prob_map[classes[i]] = float(probs[0, i])
+        else:
+            for i, c in enumerate(classes):
+                prob_map[c] = float(probs[0, i])
 
     th = _get_thresholds(classes, meta, default=0.5)
     labels, scores = [], []
     if prob_map:
         for c in classes:
             p = prob_map.get(c,0.0)
-            if p >= th.get(c,0.5): labels.append(c); scores.append(p)
+            if p >= th.get(c,0.5):
+                labels.append(c); scores.append(p)
         if not labels:
             best = int(np.argmax([prob_map.get(c,0.0) for c in classes]))
             labels, scores = [classes[best]], [prob_map[classes[best]]]
-    return labels, scores, prob_map, model_path
+    else:
+        # última salvaguarda: forzar predict a etiquetas
+        try:
+            y = model.predict(X)
+            y = np.asarray(y)
+            if y.ndim==2 and y.shape[1]==len(classes):
+                for i, c in enumerate(classes):
+                    if int(y[0,i]) == 1:
+                        labels.append(c); scores.append(1.0)
+            else:
+                labels = [str(y[0])]; scores = [1.0]
+        except Exception:
+            pass
+
+    return labels, [float(s) for s in scores], prob_map, model_path
 
 # ============================================================
-# Sugerencias simples (puedes reemplazarlas por las tuyas)
+# Sugerencias (avanzadas con métricas temporales)
 # ============================================================
-def generate_suggestions(features: Dict[str,float], labels: List[str], scores: List[float]) -> List[Dict[str,Any]]:
-    s = []
+def generate_suggestions(features: Dict[str,float], labels: List[str], scores: List[float],
+                         M: Dict[str,float]) -> List[Dict[str,Any]]:
+    s: List[Dict[str,Any]] = []
+
     ax, ay = features.get("amplitud_x",0.0), features.get("amplitud_y",0.0)
     vel = features.get("velocidad_media",0.0)
     varD = features.get("variedad_direcciones",0.0)
     nivel = features.get("nivel_rango",0.0)
+    sim = features.get("simetria",0.0)
+
+    pause = M.get("pause_ratio",0.0)
+    jerk  = M.get("jerk_mean",0.0)
+    turnR = M.get("turn_rate",0.0)
+    expV  = M.get("expansion_var",0.0)
+    lrimb = M.get("left_right_imbalance",0.0)
+    tempo = M.get("tempo_cv",1.0)
+
+    # --- Reglas base (espacio/dinámica/dirección/niveles)
     if max(ax,ay) < 60:
         s.append({"title":"Aumenta amplitud espacial","severity":"media",
                   "why":f"Amplitud baja (x≈{ax:.1f}, y≈{ay:.1f}).",
-                  "how":"Añade diagonales y niveles alto/medio/bajo con transiciones amplias."})
+                  "how":"Introduce diagonales amplias y transiciones entre niveles alto/medio/bajo."})
     if vel < 1.5:
         s.append({"title":"Proyección dinámica","severity":"media",
                   "why":f"Velocidad media baja ({vel:.2f}).",
-                  "how":"Introduce acentos y aceleraciones en 8+8 para contraste."})
+                  "how":"Acentos y aceleraciones puntuales en 8+8 para crear contraste."})
     if varD < 0.25:
         s.append({"title":"Explora direcciones","severity":"baja",
                   "why":f"Variedad direccional limitada ({varD:.2f}).",
-                  "how":"Secuencia de giros/fintas en frontal y diagonal posterior."})
+                  "how":"Secuencia de giros y cambios de foco entre frontal/diagonales."})
     if nivel > -20:
         s.append({"title":"Trabaja niveles","severity":"baja",
                   "why":f"Rango vertical escaso ({nivel:.1f}).",
-                  "how":"Incluye plié y transiciones al suelo para ampliar rango."})
+                  "how":"Incluye plié y bajadas al suelo para ampliar el rango."})
+
+    # --- Temporales (pausas, fluidez, giros, expansión, lateralidad, tempo)
+    if pause > 0.25:
+        s.append({"title":"Rellena silencios de movimiento","severity":"media",
+                  "why":f"Tiempo en pausa {pause*100:.0f}%.",
+                  "how":"Usa micro-transiciones entre frases (desplazamientos cortos, respiración activa)."})
+    if jerk > 0.35:
+        s.append({"title":"Suaviza transiciones","severity":"media",
+                  "why":f"Jerk medio alto ({jerk:.2f}).",
+                  "how":"Añade curvas en trayectorias y anticipos de peso antes de cambios bruscos."})
+    if turnR < 0.10:
+        s.append({"title":"Introduce más cambios de dirección","severity":"baja",
+                  "why":f"Pocos giros marcados (rate {turnR:.2f}).",
+                  "how":"Inserta pivots ¼-½ vuelta en remates intermedios."})
+    if expV < 0.20:
+        s.append({"title":"Varía tamaños corporales","severity":"baja",
+                  "why":f"Baja variación de expansión (CV {expV:.2f}).",
+                  "how":"Alterna gestos recogidos vs. extendidos cada 2 frases."})
+    if lrimb > 5.0:
+        s.append({"title":"Equilibra lateralidad","severity":"media",
+                  "why":f"Desequilibrio izq-der ({lrimb:.1f}).",
+                  "how":"Duplica la frase en espejo o alterna entradas por ambos lados."})
+    if tempo > 0.35:
+        s.append({"title":"Regular el pulso","severity":"media",
+                  "why":f"Tempo irregular (CV {tempo:.2f}).",
+                  "how":"Trabaja con metrónomo en 8+8 y fija acentos constantes."})
+
+    # --- Etiquetas del modelo (si existen)
+    for l, sc in zip(labels, scores):
+        if "Energía Alta" in str(l):
+            s.append({"title":"Controla la inercia en cambios","severity":"baja",
+                      "why":f"Etiqueta {l} (score {sc:.2f}).",
+                      "how":"Añade medio tiempo de sostén tras diagonales rápidas."})
+        if "Energía Baja" in str(l):
+            s.append({"title":"Amplía port de bras","severity":"media",
+                      "why":f"Etiqueta {l} (score {sc:.2f}).",
+                      "how":"Rango mayor en brazos y proyección torácica."})
+        if "Fluidez" in str(l) and jerk > 0.25:
+            s.append({"title":"Consolidar fluidez","severity":"baja",
+                      "why":f"Etiqueta {l} pero jerk {jerk:.2f}.",
+                      "how":"Conecta transiciones con trayectorias curvas y continuidad de peso."})
+
+    # --- Remate siempre útil
     s.append({"title":"Clarifica remates","severity":"baja",
               "why":"Mejora la legibilidad de las frases.",
               "how":"Pausa de ¼ tiempo y foco final en cada frase."})
     return s
 
 # ============================================================
-# Cámara HTML5 (sin dependencias)
+# Cámara HTML5 (sin dependencias externas)
 # ============================================================
 def _camera_recorder_html_ui() -> Optional[str]:
     html = """
@@ -391,7 +566,7 @@ def _camera_recorder_html_ui() -> Optional[str]:
 # UI
 # ============================================================
 st.markdown("<div class='main-header'>🎭 Asistente Coreográfico Inteligente</div>", unsafe_allow_html=True)
-st.write("Flujo **Colab**: YOLO Pose → *features* del notebook → **modelo** (thresholded bundle) → etiquetas y sugerencias.")
+st.write("Flujo **Colab**: YOLO Pose → features del notebook → **modelo** (thresholded bundle) → etiquetas y **muchas sugerencias**.")
 
 st.sidebar.header("⚙️ Configuración")
 colab_strict = st.sidebar.checkbox("Modo Colab estricto (sin fallbacks)", value=True)
@@ -409,8 +584,7 @@ video_path: Optional[str] = None
 with tab_upload:
     upv = st.file_uploader("Vídeo (mp4/mov/avi/mkv/webm)", type=["mp4","mov","avi","mkv","webm"])
     if upv:
-        video_path = _save_uploaded_video_to_tmp(upv)
-        st.video(video_path)
+        video_path = _save_uploaded_video_to_tmp(upv); st.video(video_path)
 with tab_camera:
     st.caption("Graba un clip y úsalo directamente.")
     cam_saved = _camera_recorder_html_ui()
@@ -421,9 +595,7 @@ with tab_camera:
 # ============================================================
 def _run_pipeline(video_path: str):
     meta = _probe_video(video_path)
-    if not meta.get("ok"):
-        st.error(f"No se pudo leer el vídeo: {meta.get('reason')}"); st.stop()
-
+    if not meta.get("ok"): st.error(f"No se pudo leer el vídeo: {meta.get('reason')}"); st.stop()
     fps, total = meta["fps"], meta["total_frames"]
     dur = meta["duration_s"]; W, H = meta["width"], meta["height"]
 
@@ -442,24 +614,21 @@ def _run_pipeline(video_path: str):
     progress = st.progress(0); status = st.empty()
 
     # ① YOLO Pose (obligatorio en modo estricto)
-    status.info("① Ejecutando YOLO Pose…")
-    progress.progress(15)
+    status.info("① Ejecutando YOLO Pose…"); progress.progress(15)
     K = None; used_backend = "yolo"
     try:
         K, _ = _video_to_keypoints_yolo(video_path, weights_path=yolo_weights, conf=0.25, stride=1)
     except Exception as e:
         if colab_strict:
-            st.error("❌ El backend YOLO Pose no está disponible. "
-                     "Instala las dependencias del Colab o coloca `artifacts/yolov8n-pose.pt`.")
-            st.code(str(e))
-            st.stop()
+            st.error("❌ YOLO Pose no disponible. Instala 'ultralytics torch torchvision' o coloca `artifacts/yolov8n-pose.pt`.")
+            st.code(str(e)); st.stop()
         else:
             st.warning(f"YOLO no disponible, continuar (no estricto): {e}")
             K = None; used_backend = "none"
 
     progress.progress(45)
 
-    # Vista previa (frame 0)
+    # Vista previa
     try:
         cap = cv2.VideoCapture(video_path); ret, f0 = cap.read(); cap.release()
         if ret and f0 is not None and K is not None and np.isfinite(K).any():
@@ -475,18 +644,19 @@ def _run_pipeline(video_path: str):
             st.image(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB), caption=f"Vista previa (backend: {used_backend})", use_container_width=True)
         elif ret and f0 is not None:
             st.image(cv2.cvtColor(f0, cv2.COLOR_BGR2RGB), caption=f"Vista previa (sin pose · backend: {used_backend})", use_container_width=True)
-    except Exception:
-        pass
+    except Exception: pass
 
-    # ② Features (Colab)
-    status.info("② Calculando *features* (notebook)…")
+    # ② Features + métricas temporales
+    status.info("② Calculando *features* y métricas temporales…")
     if K is None or not np.isfinite(K).any():
-        # En estricto, ya habríamos parado; aquí solo si no estricto
         st.warning("Sin pose. El modelo puede no responder como en el Colab.")
         feats = {"amplitud_x":0.0,"amplitud_y":0.0,"velocidad_media":0.0,"simetria":0.0,"nivel_rango":0.0,"variedad_direcciones":0.0,"frames":0.0}
+        metr = {"pause_ratio":0.0,"jerk_mean":0.0,"turn_rate":0.0,"expansion_var":0.0,"left_right_imbalance":0.0,"tempo_cv":1.0}
     else:
         Kc, used = _clean_nan_interpolate(K, min_valid_ratio=0.10)
-        feats = features_coreograficos(Kc if used else K)
+        Kf = Kc if used else K
+        feats = features_coreograficos(Kf)
+        metr  = timeseries_metrics(Kf)
     progress.progress(70)
 
     # ③ Modelo
@@ -500,13 +670,12 @@ def _run_pipeline(video_path: str):
         st.code("".join(traceback.format_exception_only(type(e), e)))
     progress.progress(90)
 
-    # ④ Sugerencias
+    # ④ Sugerencias (ricas)
     status.info("④ Generando sugerencias…")
-    suggestions = generate_suggestions(feats, labels, scores)
+    suggestions = generate_suggestions(feats, labels, scores, metr)
     progress.progress(100); status.success("¡Listo!")
 
-    if model_ok and model_path:
-        st.success(f"✅ Modelo cargado: **{os.path.basename(model_path)}**")
+    if model_ok and model_path: st.success(f"✅ Modelo cargado: **{os.path.basename(model_path)}**")
     st.success(f"✅ Backend usado: **{used_backend}** · Frames analizados: **{max_frames}**")
 
     colA, colB = st.columns([1,1], gap="large")
@@ -525,16 +694,19 @@ def _run_pipeline(video_path: str):
         st.subheader("Rasgos (features)")
         st.json({k: float(v) for k, v in feats.items()}, expanded=False)
 
+        st.subheader("Métricas temporales")
+        st.json({k: float(v) for k, v in metr.items()}, expanded=False)
+
     with colB:
         st.subheader("💡 Sugerencias coreográficas")
         if suggestions:
-            for s in suggestions:
+            for sg in suggestions:
                 st.markdown(
                     f"<div class='sugg'>"
-                    f"<h4>• {s.get('title','Sugerencia')}</h4>"
-                    f"<div class='why'><b>Motivo:</b> {s.get('why','')}</div>"
-                    f"<div><b>Cómo aplicarlo:</b> {s.get('how','')}</div>"
-                    f"<div class='small'>Severidad: <span class='badge'>{s.get('severity','—')}</span></div>"
+                    f"<h4>• {sg.get('title','Sugerencia')}</h4>"
+                    f"<div class='why'><b>Motivo:</b> {sg.get('why','')}</div>"
+                    f"<div><b>Cómo aplicarlo:</b> {sg.get('how','')}</div>"
+                    f"<div class='small'>Severidad: <span class='badge'>{sg.get('severity','—')}</span></div>"
                     f"</div>", unsafe_allow_html=True
                 )
         else:
@@ -545,6 +717,7 @@ def _run_pipeline(video_path: str):
         "backend": used_backend,
         "n_frames": max_frames,
         "features": feats,
+        "timeseries_metrics": metr,
         "labels": labels,
         "scores": [float(s) for s in scores],
         "probs": prob_map,
