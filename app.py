@@ -1,14 +1,13 @@
 # ============================================================
-# app.py — Asistente Coreográfico Inteligente
-#   • Upload + Cámara HTML5 (sin deps extra)
-#   • Modelo ML: complete_model_thersholder (Colab-compat)
+# app.py — Asistente Coreográfico (sin skops, compatible Colab)
+#   • Upload + Cámara HTML5 (sin deps problemáticas)
+#   • Modelo ML: complete_model_thersholder (joblib/pickle)
 #   • Progreso + Sugerencias
 # ============================================================
 
 from __future__ import annotations
 
 import os
-import io
 import json
 import base64
 import pickle
@@ -33,7 +32,7 @@ st.set_page_config(
 )
 
 # -------------------------------
-# CSS + tipografía moderna
+# CSS + tipografía
 # -------------------------------
 st.markdown("""
 <style>
@@ -53,7 +52,7 @@ html, body, [class*="css"]  { font-family: 'Inter', system-ui, -apple-system, Se
 """, unsafe_allow_html=True)
 
 # ============================================================
-# IMPORT MOTOR DE INFERENCIA (del proyecto)
+# IMPORT motor de inferencia de tu proyecto
 # ============================================================
 try:
     from src.inference import run_inference_over_video
@@ -67,7 +66,7 @@ except Exception as e:
     st.stop()
 
 # ============================================================
-# FEATURES opcionales (si tienes tu módulo del Colab)
+# FEATURES opcionales (si existen en tu repo del Colab)
 # ============================================================
 _features_fn: Optional[callable] = None
 if importlib.util.find_spec("src.features") is not None:
@@ -80,7 +79,7 @@ if importlib.util.find_spec("src.features") is not None:
             _features_fn = None
 
 # ============================================================
-# UTILIDADES: E/S vídeo, metadatos, overlays
+# Utilidades de vídeo y overlays
 # ============================================================
 def _save_uploaded_video_to_tmp(upload) -> str:
     suffix = ".mp4"
@@ -98,7 +97,6 @@ def _save_uploaded_video_to_tmp(upload) -> str:
     tmp.flush()
     return tmp.name
 
-
 def _probe_video(path: str) -> Dict[str, Any]:
     cap = cv2.VideoCapture(path)
     if not cap or not cap.isOpened():
@@ -114,17 +112,14 @@ def _probe_video(path: str) -> Dict[str, Any]:
         "width": width, "height": height, "duration_s": duration_s,
     }
 
-
 def _nice_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
-
 def _estimate_frames_for_minutes(fps: float, minutes: float) -> int:
     if fps <= 0: return int(60 * minutes * 25)  # fallback 25fps
     return int(round(minutes * 60.0 * fps))
-
 
 def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.ndarray:
     out = frame.copy()
@@ -160,7 +155,7 @@ def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.nd
     return out
 
 # ============================================================
-# FALLBACK FEATURES (si no hay src.features)
+# Features fallback (si no hay src.features)
 # ============================================================
 def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
     backend = (inf or {}).get("backend", "")
@@ -184,7 +179,6 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
 
     if not kpf: kpf = [np.zeros((0,2), dtype=float) for _ in range(n_frames)]
 
-    # 4 rasgos sencillos
     disps = []
     for i in range(1, len(kpf)):
         a, b = kpf[i-1], kpf[i]
@@ -198,9 +192,7 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
     centers_x = [float(a[:,0].mean()) for a in kpf if a.size>0]
     lateral_drift = float(np.std(centers_x)) if len(centers_x)>=2 else 0.0
 
-    tempo_irreg = 0.0
-    if len(disps) >= 3:
-        tempo_irreg = float(np.std(np.diff(disps)))
+    tempo_irreg = float(np.std(np.diff(disps))) if len(disps) >= 3 else 0.0
 
     return dict(
         motion_intensity=motion_intensity,
@@ -216,7 +208,7 @@ def compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
     return _fallback_compute_features(inf)
 
 # ============================================================
-# CARGA DEL MODELO complete_model_thersholder (Colab-compat)
+# Modelo complete_model_thersholder (joblib/pickle) — SIN SKOPS
 # ============================================================
 def _load_json_if_exists(path: str) -> Optional[Any]:
     try:
@@ -227,24 +219,22 @@ def _load_json_if_exists(path: str) -> Optional[Any]:
         pass
     return None
 
-
 def _load_complete_model_thersholder(artifacts_dir: str):
     """
-    Intenta cargar el modelo desde artifacts/ en este orden:
-    .joblib -> .pkl -> .skops
-    Devuelve (model, meta) donde meta puede incluir 'classes', 'thresholds', 'feature_order'.
+    Carga el modelo desde artifacts/ en este orden:
+    1) .joblib (requiere joblib instalado)
+    2) .pkl (pickle)
     """
     model = None
     meta: Dict[str, Any] = {}
 
     joblib_path = os.path.join(artifacts_dir, "complete_model_thersholder.joblib")
     pkl_path    = os.path.join(artifacts_dir, "complete_model_thersholder.pkl")
-    skops_path  = os.path.join(artifacts_dir, "complete_model_thersholder.skops")
 
     # Joblib
     if model is None and os.path.exists(joblib_path):
         try:
-            import joblib  # requiere que esté en requirements
+            import joblib
             model = joblib.load(joblib_path)
         except Exception as e:
             st.error("No se pudo cargar el modelo .joblib. Verifica versiones de scikit-learn/joblib.")
@@ -259,16 +249,7 @@ def _load_complete_model_thersholder(artifacts_dir: str):
             st.error("No se pudo cargar el modelo .pkl (pickle).")
             st.code("".join(traceback.format_exception_only(type(e), e)))
 
-    # SKOPS (modelo sklearn serializado seguro)
-    if model is None and os.path.exists(skops_path):
-        try:
-            from skops.io import load as skops_load  # pip install skops
-            model = skops_load(skops_path)  # type: ignore
-        except Exception as e:
-            st.error("No se pudo cargar el modelo .skops (skops no instalado o archivo incompatible).")
-            st.code("".join(traceback.format_exception_only(type(e), e)))
-
-    # Meta (opcionales)
+    # Meta opcional del Colab
     feature_order = _load_json_if_exists(os.path.join(artifacts_dir, "feature_order.json"))
     if isinstance(feature_order, list):
         meta["feature_order"] = [str(x) for x in feature_order]
@@ -283,120 +264,80 @@ def _load_complete_model_thersholder(artifacts_dir: str):
 
     return model, meta
 
-
 def _vectorize_features(features: Dict[str, float], feature_order: Optional[List[str]] = None) -> np.ndarray:
-    """
-    Convierte el dict de features en vector X con el orden esperado por el modelo.
-    Si no se proporciona feature_order, usa orden alfabético (determinista).
-    """
     if feature_order is None:
         keys = sorted(features.keys())
     else:
         keys = list(feature_order)
     return np.array([[float(features.get(k, 0.0)) for k in keys]], dtype=np.float64)
 
-
 def _get_model_classes(model, meta: Dict[str, Any]) -> List[str]:
     if "classes" in meta and isinstance(meta["classes"], list) and meta["classes"]:
         return [str(c) for c in meta["classes"]]
-    # sklearn estimators suelen tener .classes_
     classes = getattr(getattr(model, "named_steps", model), "classes_", None)
     if classes is None:
         classes = getattr(model, "classes_", None)
     if classes is not None and len(classes):
         return [str(c) for c in list(classes)]
-    # fallback genérico
     return ["Clase_0", "Clase_1"]
-
 
 def _get_thresholds(classes: List[str], meta: Dict[str, Any], default: float = 0.5) -> Dict[str, float]:
     th = {c: default for c in classes}
     meta_th = meta.get("thresholds", {})
     if isinstance(meta_th, dict):
         for c, v in meta_th.items():
-            try:
-                th[str(c)] = float(v)
-            except Exception:
-                pass
+            try: th[str(c)] = float(v)
+            except Exception: pass
     return th
-
 
 def predict_with_complete_model_thersholder(
     features: Dict[str, float],
     artifacts_dir: str = "artifacts"
 ) -> Tuple[List[str], List[float], Dict[str, float]]:
-    """
-    Emula el flujo del Colab:
-    - Cargar modelo `complete_model_thersholder`
-    - Vectorizar features según `feature_order.json` (si existe)
-    - Obtener probabilidades/scores
-    - Aplicar umbrales por clase (thresholds.json o 0.5)
-    Devuelve (labels_predichas, scores_predichas, probs_por_clase)
-    """
     model, meta = _load_complete_model_thersholder(artifacts_dir)
     if model is None:
         raise RuntimeError(
-            "No se encontró `complete_model_thersholder` en artifacts/ "
-            "(.joblib/.pkl/.skops)."
+            "No se encontró `complete_model_thersholder` en artifacts/ (.joblib/.pkl)."
         )
 
-    feature_order = meta.get("feature_order")
-    X = _vectorize_features(features, feature_order)
-
-    # Obtener puntuaciones
+    X = _vectorize_features(features, meta.get("feature_order"))
     probs: Optional[np.ndarray] = None
-    scores: Optional[np.ndarray] = None
 
-    # Pipelines sklearn: predict_proba / decision_function
-    est = model
     try:
+        est = model
         if hasattr(est, "predict_proba"):
             probs = est.predict_proba(X)
         elif hasattr(est, "decision_function"):
             df = est.decision_function(X)
-            # Escala a [0,1] sigmoid si hace falta
             if isinstance(df, np.ndarray):
                 probs = 1 / (1 + np.exp(-df))
         elif hasattr(est, "predict"):
             y = est.predict(X)
-            # OneHot aproximada como 1.0 para la clase elegida
-            if y is not None:
-                # Necesitamos clases
-                classes = _get_model_classes(model, meta)
-                probs = np.zeros((1, len(classes)), dtype=float)
-                # si y es índice
-                try:
-                    idx = int(y[0])
-                    if 0 <= idx < probs.shape[1]:
-                        probs[0, idx] = 1.0
-                except Exception:
-                    # si y es etiqueta
-                    for i, c in enumerate(classes):
-                        if str(y[0]) == str(c):
-                            probs[0, i] = 1.0
-                            break
+            classes = _get_model_classes(model, meta)
+            probs = np.zeros((1, len(classes)), dtype=float)
+            try:
+                idx = int(y[0])
+                if 0 <= idx < probs.shape[1]: probs[0, idx] = 1.0
+            except Exception:
+                for i, c in enumerate(classes):
+                    if str(y[0]) == str(c):
+                        probs[0, i] = 1.0
+                        break
     except Exception as e:
         st.error("No se pudo obtener scores del modelo. Revisa compatibilidad de versiones.")
         st.code("".join(traceback.format_exception_only(type(e), e)))
-        # Seguimos con fallback
         probs = None
 
     classes = _get_model_classes(model, meta)
-
-    # Ajuste de forma a (1, n_clases)
     if probs is not None and probs.ndim == 1:
         probs = probs.reshape(1, -1)
 
-    # Diccionario de probabilidades por clase (para reportar)
     prob_map: Dict[str, float] = {}
     if probs is not None and probs.shape[1] == len(classes):
         for i, c in enumerate(classes):
             prob_map[c] = float(probs[0, i])
 
-    # Umbrales
     thresholds = _get_thresholds(classes, meta, default=0.5)
-
-    # Lógica de predicción (multi-etiqueta por umbral)
     labels_out: List[str] = []
     scores_out: List[float] = []
 
@@ -404,28 +345,18 @@ def predict_with_complete_model_thersholder(
         for c in classes:
             p = prob_map.get(c, 0.0)
             if p >= thresholds.get(c, 0.5):
-                labels_out.append(c)
-                scores_out.append(p)
-        # Si ningún label supera el umbral, devolvemos el top-1 para no dejar vacío
+                labels_out.append(c); scores_out.append(p)
         if not labels_out:
             best_idx = int(np.argmax([prob_map.get(c, 0.0) for c in classes]))
             labels_out = [classes[best_idx]]
             scores_out = [prob_map[classes[best_idx]]]
-    else:
-        # Sin probabilidades: devolvemos vacío (UI mostrará fallback si quieres)
-        pass
 
     return labels_out, scores_out, prob_map
 
-
 # ============================================================
-# SUGERENCIAS (fallback por reglas, siempre disponible)
+# Sugerencias (reglas simples, siempre disponible)
 # ============================================================
-def _fallback_generate_suggestions(
-    features: Dict[str, float],
-    labels: List[str],
-    scores: List[float]
-) -> List[Dict[str, Any]]:
+def _generate_suggestions(features: Dict[str, float], labels: List[str], scores: List[float]) -> List[Dict[str, Any]]:
     s = []
     mi = features.get("motion_intensity", 0.0)
     va = features.get("vertical_amplitude", 0.0)
@@ -450,7 +381,6 @@ def _fallback_generate_suggestions(
     s.append({"title":"Clarifica intenciones en remates","severity":"baja",
               "why":"Mejora la legibilidad gestual.","how":"Define foco y mirada en compases finales; 1/4 de tiempo para presentar el gesto."})
     return s
-
 
 # ============================================================
 # Cámara HTML5 (MediaRecorder) — sin dependencias extra
@@ -536,16 +466,12 @@ def _camera_recorder_html_ui() -> Optional[str]:
         return tmp_path
     return None
 
-
 # ============================================================
-# UI — Encabezado
+# UI
 # ============================================================
 st.markdown("<div class='main-header'>🎭 Asistente Coreográfico Inteligente</div>", unsafe_allow_html=True)
 st.write("Analiza vídeos (upload o **cámara HTML5**) y ejecuta el **modelo ML `complete_model_thersholder`** como en Colab. Incluye progreso y sugerencias.")
 
-# ============================================================
-# Sidebar — Configuración
-# ============================================================
 st.sidebar.header("⚙️ Configuración")
 backend = st.sidebar.selectbox("Backend de visión", ["mediapipe", "yolo"], index=0)
 yolo_model_path = st.sidebar.text_input("Ruta modelo YOLO (si aplica)", "artifacts/yolo.pt")
@@ -560,11 +486,8 @@ with st.sidebar.expander("⚙️ Avanzado"):
     artifacts_dir = st.text_input("Carpeta de artifacts", "artifacts")
 
 st.sidebar.markdown("---")
-st.sidebar.info("Coloca tu modelo en `artifacts/complete_model_thersholder.(joblib|pkl|skops)`.\nOpcional: feature_order.json, class_names.json, thresholds.json")
+st.sidebar.info("Coloca tu modelo en `artifacts/complete_model_thersholder.(joblib|pkl)`.\nOpcional: feature_order.json, class_names.json, thresholds.json")
 
-# ============================================================
-# Entrada de vídeo: Upload o Cámara
-# ============================================================
 tab_upload, tab_camera = st.tabs(["📤 Subir vídeo", "🎥 Grabar con cámara (HTML5)"])
 video_path: Optional[str] = None
 
@@ -581,7 +504,7 @@ with tab_camera:
         video_path = cam_saved
 
 # ============================================================
-# Análisis con progreso — INFERENCIA → FEATURES → ML → SUGERENCIAS
+# Pipeline con progreso — INFERENCIA → FEATURES → ML → SUGERENCIAS
 # ============================================================
 def _run_pipeline(video_path: str):
     meta = _probe_video(video_path)
@@ -623,7 +546,7 @@ def _run_pipeline(video_path: str):
         )
     progress.progress(40)
 
-    # Vista previa + overlay
+    # Vista previa
     try:
         cap = cv2.VideoCapture(video_path)
         ret, frame0 = cap.read(); cap.release()
@@ -653,7 +576,7 @@ def _run_pipeline(video_path: str):
 
     # ④ SUGERENCIAS
     status_box.info("④ Generando **sugerencias coreográficas**…")
-    suggestions = _fallback_generate_suggestions(feats, labels, scores)
+    suggestions = _generate_suggestions(feats, labels, scores)
     progress.progress(95)
 
     # ⑤ SALIDA
@@ -717,7 +640,6 @@ def _run_pipeline(video_path: str):
 
     with st.expander("📦 Ver JSON bruto de inferencia"):
         st.json(results, expanded=False)
-
 
 # ============================================================
 # Lanzador
