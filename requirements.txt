@@ -1,12 +1,23 @@
-streamlit>=1.37
-numpy==1.26.4
-pandas==2.2.2
-opencv-python-headless>=4.9
-Pillow>=10.2
-joblib==1.4.2
-scikit-learn==1.4.2 ; python_version < "3.12"
-scikit-learn==1.7.1 ; python_version >= "3.12"
-mediapipe>=0.10
-ultralytics>=8.2
-streamlit-webrtc>=0.47.6
-av>=10.0.0
+# Core UI
+streamlit>=1.37.0
+
+# NumPy stack
+numpy>=1.26
+Pillow>=10.4.0
+
+# Video / CV en CPU (sin ventanas)
+opencv-python-headless>=4.10.0.84
+
+# --- OPCIONALES (descomenta solo si los usas de verdad) ---
+# MediaPipe (pose). OJO: si lo usas, instala también protobuf<4.
+# mediapipe==0.10.14
+# protobuf<4
+
+# YOLO (ultralytics) y PyTorch. Pesado en la nube; mejor local o Docker con GPU.
+# ultralytics>=8.2.0
+# torch>=2.3.0
+# torchvision>=0.18.0
+
+# Si tu modelo ML (del Colab) usa scikit-learn/joblib, iguala las versiones de entrenamiento:
+# scikit-learn==1.3.2
+# joblib==1.3.2

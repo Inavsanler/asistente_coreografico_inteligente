@@ -1,12 +1,17 @@
 # ============================================================
-# app.py — Asistente Coreográfico Inteligente (Upload + Cámara HTML5)
+# app.py — Asistente Coreográfico Inteligente
+#   • Upload + Cámara HTML5 (sin deps extra)
+#   • Modelo ML: complete_model_thersholder (Colab-compat)
+#   • Progreso + Sugerencias
 # ============================================================
 
 from __future__ import annotations
 
 import os
+import io
 import json
 import base64
+import pickle
 import traceback
 import tempfile
 import importlib.util
@@ -16,7 +21,6 @@ import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
 import cv2
-from PIL import Image  # noqa: F401
 
 # -------------------------------
 # Configuración de la página
@@ -29,11 +33,12 @@ st.set_page_config(
 )
 
 # -------------------------------
-# CSS
+# CSS + tipografía moderna
 # -------------------------------
-st.markdown(
-    """
+st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+html, body, [class*="css"]  { font-family: 'Inter', system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
 :root{ --pri:#111827; --sec:#374151; --acc:#2563eb; --ok:#059669; --warn:#b45309; --err:#dc2626; }
 .main-header{font-size:2.2rem;color:var(--pri);text-align:center;font-weight:700;margin:0.5rem 0 1rem 0}
 .card{border:1px solid #e5e7eb;border-radius:14px;padding:16px;margin:8px 0;background:#ffffff}
@@ -45,32 +50,26 @@ st.markdown(
 .sugg .why{color:#6b7280;font-size:.9rem}
 .note{font-size:.9rem;color:#6b7280}
 </style>
-""",
-    unsafe_allow_html=True,
-)
+""", unsafe_allow_html=True)
 
 # ============================================================
-# IMPORT ROBUSTO DEL MOTOR DE INFERENCIA
+# IMPORT MOTOR DE INFERENCIA (del proyecto)
 # ============================================================
 try:
     from src.inference import run_inference_over_video
 except SyntaxError as e:
-    st.error("Hay un **error de sintaxis** en `src/inference.py`. Revísalo. Detalle en logs.")
+    st.error("Hay un **error de sintaxis** en `src/inference.py`. Revísalo.")
     st.code("".join(traceback.format_exception_only(type(e), e)))
-    raise
+    st.stop()
 except Exception as e:
     st.error("No se pudo importar `run_inference_over_video` desde `src/inference.py`.")
     st.code("".join(traceback.format_exception_only(type(e), e)))
-    raise
+    st.stop()
 
 # ============================================================
-# IMPORTS OPCIONALES (proyecto Colab / repo original) — SEGUROS
+# FEATURES opcionales (si tienes tu módulo del Colab)
 # ============================================================
 _features_fn: Optional[callable] = None
-_predict_fn: Optional[callable] = None
-_suggestions_fn: Optional[callable] = None
-
-# 1) features
 if importlib.util.find_spec("src.features") is not None:
     try:
         from src.features import compute_features_from_inference as _features_fn  # type: ignore
@@ -80,22 +79,8 @@ if importlib.util.find_spec("src.features") is not None:
         except Exception:
             _features_fn = None
 
-# 2) predicción ML
-if importlib.util.find_spec("src.model") is not None:
-    try:
-        from src.model import predict_labels as _predict_fn  # type: ignore
-    except Exception:
-        _predict_fn = None
-
-# 3) sugerencias
-if importlib.util.find_spec("src.suggestions") is not None:
-    try:
-        from src.suggestions import generate_suggestions as _suggestions_fn  # type: ignore
-    except Exception:
-        _suggestions_fn = None
-
 # ============================================================
-# UTILIDADES
+# UTILIDADES: E/S vídeo, metadatos, overlays
 # ============================================================
 def _save_uploaded_video_to_tmp(upload) -> str:
     suffix = ".mp4"
@@ -125,88 +110,97 @@ def _probe_video(path: str) -> Dict[str, Any]:
     duration_s = total_frames / fps if fps > 0 else 0.0
     cap.release()
     return {
-        "ok": True,
-        "fps": float(fps),
-        "total_frames": total_frames,
-        "width": width,
-        "height": height,
-        "duration_s": duration_s,
+        "ok": True, "fps": float(fps), "total_frames": total_frames,
+        "width": width, "height": height, "duration_s": duration_s,
     }
 
 
 def _nice_time(seconds: float) -> str:
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
 
 def _estimate_frames_for_minutes(fps: float, minutes: float) -> int:
-    if fps <= 0:
-        return int(60 * minutes * 25)  # fallback 25fps
+    if fps <= 0: return int(60 * minutes * 25)  # fallback 25fps
     return int(round(minutes * 60.0 * fps))
 
 
-# ---------------- Fallbacks (por si no hay módulos del repo) ----------------
+def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.ndarray:
+    out = frame.copy()
+    h, w = out.shape[:2]
+    backend = (result_data or {}).get("backend", "")
+    data = (result_data or {}).get("data", {})
+    try:
+        if backend == "mediapipe":
+            kps0 = (data.get("keypoints") or [])
+            if kps0:
+                kps = kps0[0].get("pose") or []
+                for (xn, yn, sc) in kps:
+                    x = int(xn * w); y = int(yn * h)
+                    cv2.circle(out, (x, y), 3, (0, 200, 0), -1)
+        elif backend == "yolo":
+            det0 = (data.get("detections") or [])
+            if det0:
+                for obj in det0[0]:
+                    if "boxes" in obj:
+                        bxs = obj.get("boxes")
+                        if isinstance(bxs, list) and len(bxs) > 0:
+                            for rect in bxs:
+                                if len(rect) >= 4:
+                                    x1, y1, x2, y2 = map(int, rect[:4])
+                                    cv2.rectangle(out, (x1, y1), (x2, y2), (60, 60, 240), 2)
+                    if "keypoints" in obj:
+                        for pt in obj.get("keypoints") or []:
+                            if isinstance(pt, list) and len(pt) >= 2:
+                                x, y = int(pt[0]), int(pt[1])
+                                cv2.circle(out, (x, y), 3, (0, 200, 255), -1)
+    except Exception:
+        pass
+    return out
+
+# ============================================================
+# FALLBACK FEATURES (si no hay src.features)
+# ============================================================
 def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
     backend = (inf or {}).get("backend", "")
     data = (inf or {}).get("data", {})
     n_frames = max(1, int(inf.get("n_frames", 0)))
-    keypoints_per_frame: List[np.ndarray] = []
+    kpf: List[np.ndarray] = []
 
     if backend == "mediapipe":
-        frames = data.get("keypoints") or []
-        for fr in frames:
+        for fr in (data.get("keypoints") or []):
             pts = fr.get("pose") or []
-            if not pts:
-                keypoints_per_frame.append(np.zeros((0, 2), dtype=float))
-                continue
             arr = np.array([(p[0], p[1]) for p in pts if isinstance(p, (list, tuple)) and len(p) >= 2], dtype=float)
-            keypoints_per_frame.append(arr)
+            kpf.append(arr)
     elif backend == "yolo":
-        frames = data.get("detections") or []
-        for fr in frames:
+        for fr in (data.get("detections") or []):
             pts = None
             for obj in fr:
                 if "keypoints" in obj and obj["keypoints"]:
-                    pts = obj["keypoints"]
-                    break
-            if pts is None:
-                keypoints_per_frame.append(np.zeros((0, 2), dtype=float))
-            else:
-                arr = np.array([[p[0], p[1]] for p in pts if isinstance(p, (list, tuple)) and len(p) >= 2], dtype=float)
-                keypoints_per_frame.append(arr)
+                    pts = obj["keypoints"]; break
+            arr = np.array([[p[0], p[1]] for p in (pts or []) if isinstance(p, (list, tuple)) and len(p) >= 2], dtype=float)
+            kpf.append(arr)
 
-    if not keypoints_per_frame:
-        keypoints_per_frame = [np.zeros((0, 2), dtype=float) for _ in range(n_frames)]
+    if not kpf: kpf = [np.zeros((0,2), dtype=float) for _ in range(n_frames)]
 
+    # 4 rasgos sencillos
     disps = []
-    for i in range(1, len(keypoints_per_frame)):
-        a = keypoints_per_frame[i - 1]
-        b = keypoints_per_frame[i]
+    for i in range(1, len(kpf)):
+        a, b = kpf[i-1], kpf[i]
         if a.shape == b.shape and a.size > 0:
-            d = np.linalg.norm(b - a, axis=1).mean()
-            disps.append(float(d))
+            disps.append(float(np.linalg.norm(b - a, axis=1).mean()))
     motion_intensity = float(np.mean(disps)) if disps else 0.0
 
-    ranges = []
-    for a in keypoints_per_frame:
-        if a.size > 0:
-            rng = float((a[:, 1].max() - a[:, 1].min()))
-            ranges.append(rng)
+    ranges = [float((a[:,1].max() - a[:,1].min())) for a in kpf if a.size>0]
     vertical_amplitude = float(np.mean(ranges)) if ranges else 0.0
 
-    centers_x = []
-    for a in keypoints_per_frame:
-        if a.size > 0:
-            centers_x.append(float(a[:, 0].mean()))
-    lateral_drift = float(np.std(centers_x)) if len(centers_x) >= 2 else 0.0
+    centers_x = [float(a[:,0].mean()) for a in kpf if a.size>0]
+    lateral_drift = float(np.std(centers_x)) if len(centers_x)>=2 else 0.0
 
     tempo_irreg = 0.0
     if len(disps) >= 3:
-        deltas = np.diff(disps)
-        tempo_irreg = float(np.std(deltas))
+        tempo_irreg = float(np.std(np.diff(disps)))
 
     return dict(
         motion_intensity=motion_intensity,
@@ -215,31 +209,218 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
         tempo_irregularity=tempo_irreg,
     )
 
+def compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
+    if _features_fn is not None:
+        try: return _features_fn(inf)
+        except Exception: pass
+    return _fallback_compute_features(inf)
 
-def _fallback_predict_labels(features: Dict[str, float], artifacts_dir: str = "artifacts") -> Tuple[List[str], List[float]]:
-    mi = features.get("motion_intensity", 0.0)
-    va = features.get("vertical_amplitude", 0.0)
-    ld = features.get("lateral_drift", 0.0)
-    ti = features.get("tempo_irregularity", 0.0)
-
-    labels, scores = [], []
-    if mi > 8e-2:       labels.append("Energía Alta");  scores.append(min(0.99, mi))
-    elif mi > 3e-2:     labels.append("Energía Media"); scores.append(min(0.8, mi + 0.1))
-    else:               labels.append("Energía Baja");   scores.append(min(0.7, 0.5 - mi))
-
-    if va > 6e-2:       labels.append("Amplitud Elevada"); scores.append(min(0.95, va + 0.1))
-    elif va > 3e-2:     labels.append("Amplitud Media");   scores.append(min(0.85, va + 0.05))
-    else:               labels.append("Amplitud Reducida");scores.append(min(0.75, 0.5 - va))
-
-    if ld > 6e-2:       labels.append("Deriva Lateral Alta"); scores.append(min(0.9, ld + 0.1))
-    else:               labels.append("Deriva Lateral Controlada"); scores.append(min(0.8, 0.6 - ld))
-
-    if ti > 2e-2:       labels.append("Tempo Irregular"); scores.append(min(0.9, ti + 0.1))
-    else:               labels.append("Tempo Estable");   scores.append(min(0.85, 0.7 - ti))
-
-    return labels, scores
+# ============================================================
+# CARGA DEL MODELO complete_model_thersholder (Colab-compat)
+# ============================================================
+def _load_json_if_exists(path: str) -> Optional[Any]:
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
 
 
+def _load_complete_model_thersholder(artifacts_dir: str):
+    """
+    Intenta cargar el modelo desde artifacts/ en este orden:
+    .joblib -> .pkl -> .skops
+    Devuelve (model, meta) donde meta puede incluir 'classes', 'thresholds', 'feature_order'.
+    """
+    model = None
+    meta: Dict[str, Any] = {}
+
+    joblib_path = os.path.join(artifacts_dir, "complete_model_thersholder.joblib")
+    pkl_path    = os.path.join(artifacts_dir, "complete_model_thersholder.pkl")
+    skops_path  = os.path.join(artifacts_dir, "complete_model_thersholder.skops")
+
+    # Joblib
+    if model is None and os.path.exists(joblib_path):
+        try:
+            import joblib  # requiere que esté en requirements
+            model = joblib.load(joblib_path)
+        except Exception as e:
+            st.error("No se pudo cargar el modelo .joblib. Verifica versiones de scikit-learn/joblib.")
+            st.code("".join(traceback.format_exception_only(type(e), e)))
+
+    # Pickle
+    if model is None and os.path.exists(pkl_path):
+        try:
+            with open(pkl_path, "rb") as f:
+                model = pickle.load(f)
+        except Exception as e:
+            st.error("No se pudo cargar el modelo .pkl (pickle).")
+            st.code("".join(traceback.format_exception_only(type(e), e)))
+
+    # SKOPS (modelo sklearn serializado seguro)
+    if model is None and os.path.exists(skops_path):
+        try:
+            from skops.io import load as skops_load  # pip install skops
+            model = skops_load(skops_path)  # type: ignore
+        except Exception as e:
+            st.error("No se pudo cargar el modelo .skops (skops no instalado o archivo incompatible).")
+            st.code("".join(traceback.format_exception_only(type(e), e)))
+
+    # Meta (opcionales)
+    feature_order = _load_json_if_exists(os.path.join(artifacts_dir, "feature_order.json"))
+    if isinstance(feature_order, list):
+        meta["feature_order"] = [str(x) for x in feature_order]
+
+    class_names = _load_json_if_exists(os.path.join(artifacts_dir, "class_names.json"))
+    if isinstance(class_names, list):
+        meta["classes"] = [str(x) for x in class_names]
+
+    thresholds = _load_json_if_exists(os.path.join(artifacts_dir, "thresholds.json"))
+    if isinstance(thresholds, dict):
+        meta["thresholds"] = {str(k): float(v) for k, v in thresholds.items() if isinstance(v, (int,float))}
+
+    return model, meta
+
+
+def _vectorize_features(features: Dict[str, float], feature_order: Optional[List[str]] = None) -> np.ndarray:
+    """
+    Convierte el dict de features en vector X con el orden esperado por el modelo.
+    Si no se proporciona feature_order, usa orden alfabético (determinista).
+    """
+    if feature_order is None:
+        keys = sorted(features.keys())
+    else:
+        keys = list(feature_order)
+    return np.array([[float(features.get(k, 0.0)) for k in keys]], dtype=np.float64)
+
+
+def _get_model_classes(model, meta: Dict[str, Any]) -> List[str]:
+    if "classes" in meta and isinstance(meta["classes"], list) and meta["classes"]:
+        return [str(c) for c in meta["classes"]]
+    # sklearn estimators suelen tener .classes_
+    classes = getattr(getattr(model, "named_steps", model), "classes_", None)
+    if classes is None:
+        classes = getattr(model, "classes_", None)
+    if classes is not None and len(classes):
+        return [str(c) for c in list(classes)]
+    # fallback genérico
+    return ["Clase_0", "Clase_1"]
+
+
+def _get_thresholds(classes: List[str], meta: Dict[str, Any], default: float = 0.5) -> Dict[str, float]:
+    th = {c: default for c in classes}
+    meta_th = meta.get("thresholds", {})
+    if isinstance(meta_th, dict):
+        for c, v in meta_th.items():
+            try:
+                th[str(c)] = float(v)
+            except Exception:
+                pass
+    return th
+
+
+def predict_with_complete_model_thersholder(
+    features: Dict[str, float],
+    artifacts_dir: str = "artifacts"
+) -> Tuple[List[str], List[float], Dict[str, float]]:
+    """
+    Emula el flujo del Colab:
+    - Cargar modelo `complete_model_thersholder`
+    - Vectorizar features según `feature_order.json` (si existe)
+    - Obtener probabilidades/scores
+    - Aplicar umbrales por clase (thresholds.json o 0.5)
+    Devuelve (labels_predichas, scores_predichas, probs_por_clase)
+    """
+    model, meta = _load_complete_model_thersholder(artifacts_dir)
+    if model is None:
+        raise RuntimeError(
+            "No se encontró `complete_model_thersholder` en artifacts/ "
+            "(.joblib/.pkl/.skops)."
+        )
+
+    feature_order = meta.get("feature_order")
+    X = _vectorize_features(features, feature_order)
+
+    # Obtener puntuaciones
+    probs: Optional[np.ndarray] = None
+    scores: Optional[np.ndarray] = None
+
+    # Pipelines sklearn: predict_proba / decision_function
+    est = model
+    try:
+        if hasattr(est, "predict_proba"):
+            probs = est.predict_proba(X)
+        elif hasattr(est, "decision_function"):
+            df = est.decision_function(X)
+            # Escala a [0,1] sigmoid si hace falta
+            if isinstance(df, np.ndarray):
+                probs = 1 / (1 + np.exp(-df))
+        elif hasattr(est, "predict"):
+            y = est.predict(X)
+            # OneHot aproximada como 1.0 para la clase elegida
+            if y is not None:
+                # Necesitamos clases
+                classes = _get_model_classes(model, meta)
+                probs = np.zeros((1, len(classes)), dtype=float)
+                # si y es índice
+                try:
+                    idx = int(y[0])
+                    if 0 <= idx < probs.shape[1]:
+                        probs[0, idx] = 1.0
+                except Exception:
+                    # si y es etiqueta
+                    for i, c in enumerate(classes):
+                        if str(y[0]) == str(c):
+                            probs[0, i] = 1.0
+                            break
+    except Exception as e:
+        st.error("No se pudo obtener scores del modelo. Revisa compatibilidad de versiones.")
+        st.code("".join(traceback.format_exception_only(type(e), e)))
+        # Seguimos con fallback
+        probs = None
+
+    classes = _get_model_classes(model, meta)
+
+    # Ajuste de forma a (1, n_clases)
+    if probs is not None and probs.ndim == 1:
+        probs = probs.reshape(1, -1)
+
+    # Diccionario de probabilidades por clase (para reportar)
+    prob_map: Dict[str, float] = {}
+    if probs is not None and probs.shape[1] == len(classes):
+        for i, c in enumerate(classes):
+            prob_map[c] = float(probs[0, i])
+
+    # Umbrales
+    thresholds = _get_thresholds(classes, meta, default=0.5)
+
+    # Lógica de predicción (multi-etiqueta por umbral)
+    labels_out: List[str] = []
+    scores_out: List[float] = []
+
+    if prob_map:
+        for c in classes:
+            p = prob_map.get(c, 0.0)
+            if p >= thresholds.get(c, 0.5):
+                labels_out.append(c)
+                scores_out.append(p)
+        # Si ningún label supera el umbral, devolvemos el top-1 para no dejar vacío
+        if not labels_out:
+            best_idx = int(np.argmax([prob_map.get(c, 0.0) for c in classes]))
+            labels_out = [classes[best_idx]]
+            scores_out = [prob_map[classes[best_idx]]]
+    else:
+        # Sin probabilidades: devolvemos vacío (UI mostrará fallback si quieres)
+        pass
+
+    return labels_out, scores_out, prob_map
+
+
+# ============================================================
+# SUGERENCIAS (fallback por reglas, siempre disponible)
+# ============================================================
 def _fallback_generate_suggestions(
     features: Dict[str, float],
     labels: List[str],
@@ -271,77 +452,10 @@ def _fallback_generate_suggestions(
     return s
 
 
-def compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
-    if _features_fn is not None:
-        try:
-            return _features_fn(inf)
-        except Exception:
-            pass
-    return _fallback_compute_features(inf)
-
-
-def predict_labels(features: Dict[str, float], artifacts_dir: str = "artifacts") -> Tuple[List[str], List[float]]:
-    if _predict_fn is not None:
-        try:
-            return _predict_fn(features, artifacts_dir=artifacts_dir)
-        except Exception:
-            pass
-    return _fallback_predict_labels(features, artifacts_dir=artifacts_dir)
-
-
-def generate_suggestions(features: Dict[str, float], labels: List[str], scores: List[float]) -> List[Dict[str, Any]]:
-    if _suggestions_fn is not None:
-        try:
-            return _suggestions_fn(features, labels, scores)
-        except Exception:
-            pass
-    return _fallback_generate_suggestions(features, labels, scores)
-
-
-def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.ndarray:
-    out = frame.copy()
-    h, w = out.shape[:2]
-    backend = (result_data or {}).get("backend", "")
-    data = (result_data or {}).get("data", {})
-    try:
-        if backend == "mediapipe":
-            kps0 = (data.get("keypoints") or [])
-            if kps0:
-                kps = kps0[0].get("pose") or []
-                for (xn, yn, sc) in kps:
-                    x = int(xn * w); y = int(yn * h)
-                    cv2.circle(out, (x, y), 3, (0, 200, 0), -1)
-        elif backend == "yolo":
-            det0 = (data.get("detections") or [])
-            if det0:
-                first = det0[0]
-                for obj in first:
-                    if "boxes" in obj:
-                        bxs = obj.get("boxes")
-                        if isinstance(bxs, list) and len(bxs) > 0:
-                            for rect in bxs:
-                                if len(rect) >= 4:
-                                    x1, y1, x2, y2 = map(int, rect[:4])
-                                    cv2.rectangle(out, (x1, y1), (x2, y2), (60, 60, 240), 2)
-                    if "keypoints" in obj:
-                        pts = obj.get("keypoints") or []
-                        for pt in pts:
-                            if isinstance(pt, list) and len(pt) >= 2:
-                                x, y = int(pt[0]), int(pt[1])
-                                cv2.circle(out, (x, y), 3, (0, 200, 255), -1)
-    except Exception:
-        pass
-    return out
-
-
 # ============================================================
-# Cámara HTML5: grabar vídeo sin dependencias extra
+# Cámara HTML5 (MediaRecorder) — sin dependencias extra
 # ============================================================
 def _camera_recorder_html_ui() -> Optional[str]:
-    """
-    Devuelve una ruta temporal a un vídeo grabado con la cámara (si el usuario pulsa "Usar clip").
-    Implementado con MediaRecorder en un componente HTML (sin streamlit-webrtc ni av).
-    """
     html = """
     <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
       <video id="preview" autoplay playsinline style="width:100%;max-height:260px;background:#000;border-radius:12px"></video>
@@ -364,96 +478,59 @@ def _camera_recorder_html_ui() -> Optional[str]:
         const useBtn = document.getElementById('useBtn');
         const maxSec = document.getElementById('maxSec');
         const fps = document.getElementById('fps');
+        let mediaStream = null, mediaRecorder = null, chunks = [], timer = null;
 
-        let mediaStream = null;
-        let mediaRecorder = null;
-        let chunks = [];
-        let timer = null;
-
-        function postValue(val){
-          const msg = { type: 'streamlit:setComponentValue', value: val };
-          window.parent.postMessage(msg, '*');
-        }
-        function componentReady(){
-          const msg = { type: 'streamlit:componentReady', value: true };
-          window.parent.postMessage(msg, '*');
-        }
+        function postValue(val){ window.parent.postMessage({type:'streamlit:setComponentValue', value: val}, '*'); }
+        function componentReady(){ window.parent.postMessage({type:'streamlit:componentReady', value:true}, '*'); }
         componentReady();
 
         async function initCamera(){
-          if (mediaStream) return;
           try{
             mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
             video.srcObject = mediaStream;
-          }catch(e){
-            document.getElementById('note').innerText = 'No se pudo acceder a la cámara: ' + e;
-          }
+          }catch(e){ document.getElementById('note').innerText = 'No se pudo acceder a la cámara: ' + e; }
         }
         initCamera();
 
         startBtn.onclick = () => {
-          if (!mediaStream){ return; }
+          if (!mediaStream) return;
           chunks = [];
           let mime = 'video/webm;codecs=vp9';
           if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
           if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
-          try{
-            mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime });
-          }catch(e){
-            document.getElementById('note').innerText = 'MediaRecorder no soportado en este navegador.';
-            return;
-          }
+          try{ mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime }); }
+          catch(e){ document.getElementById('note').innerText = 'MediaRecorder no soportado en este navegador.'; return; }
+
           mediaRecorder.ondataavailable = ev => { if (ev.data && ev.data.size > 0) chunks.push(ev.data); };
           mediaRecorder.onstop = () => { stopBtn.disabled = true; useBtn.disabled = chunks.length === 0; };
           mediaRecorder.start(Math.max(1000 / parseInt(fps.value||'24'), 200));
-          startBtn.disabled = true;
-          stopBtn.disabled = false;
-          useBtn.disabled = true;
+          startBtn.disabled = true; stopBtn.disabled = false; useBtn.disabled = true;
 
-          const limit = parseInt(maxSec.value || '15');
-          if (timer) clearTimeout(timer);
+          const limit = parseInt(maxSec.value || '15'); if (timer) clearTimeout(timer);
           timer = setTimeout(()=>{ try{ mediaRecorder.stop(); }catch{} }, limit*1000);
         };
 
         stopBtn.onclick = () => {
           try{ mediaRecorder && mediaRecorder.stop(); }catch{}
-          startBtn.disabled = false;
-          stopBtn.disabled = true;
+          startBtn.disabled = false; stopBtn.disabled = true;
         };
 
         useBtn.onclick = async () => {
-          if (chunks.length === 0) return;
+          if (!chunks.length) return;
           const blob = new Blob(chunks, { type: 'video/webm' });
           const reader = new FileReader();
-          reader.onloadend = () => {
-            const dataUrl = reader.result; // data:video/webm;base64,AAA...
-            postValue(dataUrl);
-          };
+          reader.onloadend = () => { postValue(reader.result); }; // data:video/webm;base64,AAA...
           reader.readAsDataURL(blob);
         };
-
-        // Habilitar el botón usar clip al finalizar
-        const observer = new MutationObserver(()=>{});
-        observer.observe(document.body, {subtree:true,childList:true});
-
-        // Activar/desactivar según eventos
-        video.onplaying = ()=>{};
-        video.onpause = ()=>{};
-        // Inicial
-        useBtn.disabled = true;
       </script>
     </div>
     """
     data_url = components.html(html, height=420, scrolling=False)
     if isinstance(data_url, str) and data_url.startswith("data:video/"):
-        # Guardar a archivo temporal
         header, b64 = data_url.split(",", 1)
-        ext = ".webm"
-        if "mp4" in header:
-            ext = ".mp4"
+        ext = ".webm" if "webm" in header else ".mp4"
         tmp_path = tempfile.NamedTemporaryFile(delete=False, suffix=ext).name
-        with open(tmp_path, "wb") as f:
-            f.write(base64.b64decode(b64))
+        with open(tmp_path, "wb") as f: f.write(base64.b64decode(b64))
         st.success(f"✅ Clip guardado: {os.path.basename(tmp_path)}")
         st.video(tmp_path)
         return tmp_path
@@ -464,21 +541,14 @@ def _camera_recorder_html_ui() -> Optional[str]:
 # UI — Encabezado
 # ============================================================
 st.markdown("<div class='main-header'>🎭 Asistente Coreográfico Inteligente</div>", unsafe_allow_html=True)
-st.write("Analiza vídeos de danza (subidos o **grabados desde tu cámara** sin dependencias extra) y recibe **sugerencias coreográficas**.")
-
-# Avisos de fallback (opcionales)
-if _predict_fn is None:
-    st.caption("⚠️ Predicción ML: usando heurística interna (no se encontró `src.model`).")
-if _suggestions_fn is None:
-    st.caption("⚠️ Sugerencias: generador interno por reglas (no se encontró `src.suggestions`).")
+st.write("Analiza vídeos (upload o **cámara HTML5**) y ejecuta el **modelo ML `complete_model_thersholder`** como en Colab. Incluye progreso y sugerencias.")
 
 # ============================================================
 # Sidebar — Configuración
 # ============================================================
 st.sidebar.header("⚙️ Configuración")
-
 backend = st.sidebar.selectbox("Backend de visión", ["mediapipe", "yolo"], index=0)
-yolo_model_path = st.sidebar.text_input("Ruta del modelo YOLO (si aplica)", "artifacts/yolo.pt")
+yolo_model_path = st.sidebar.text_input("Ruta modelo YOLO (si aplica)", "artifacts/yolo.pt")
 
 with st.sidebar.expander("⏱️ Duración a analizar (del inicio)"):
     target_minutes = st.slider("Minutos", 0.5, 5.0, 3.0, 0.5)
@@ -487,16 +557,15 @@ with st.sidebar.expander("⏱️ Duración a analizar (del inicio)"):
 with st.sidebar.expander("⚙️ Avanzado"):
     manual_max_frames = st.checkbox("Fijar manualmente máx. de frames", value=False)
     max_frames_manual_value = st.number_input("Máx. frames", min_value=10, max_value=20000, value=600, step=10)
-    artifacts_dir = st.text_input("Carpeta de artifacts (bundle, CSV, modelos)", "artifacts")
+    artifacts_dir = st.text_input("Carpeta de artifacts", "artifacts")
 
 st.sidebar.markdown("---")
-st.sidebar.info("Si tienes `src/features.py`, `src/model.py`, `src/suggestions.py`, se usarán automáticamente.")
+st.sidebar.info("Coloca tu modelo en `artifacts/complete_model_thersholder.(joblib|pkl|skops)`.\nOpcional: feature_order.json, class_names.json, thresholds.json")
 
 # ============================================================
-# Entrada de vídeo: Upload o Cámara HTML5
+# Entrada de vídeo: Upload o Cámara
 # ============================================================
 tab_upload, tab_camera = st.tabs(["📤 Subir vídeo", "🎥 Grabar con cámara (HTML5)"])
-
 video_path: Optional[str] = None
 
 with tab_upload:
@@ -509,57 +578,19 @@ with tab_camera:
     st.markdown("Graba un **clip de vídeo** desde tu cámara (HTML5/MediaRecorder) y úsalo directamente en el análisis.")
     cam_saved = _camera_recorder_html_ui()
     if cam_saved:
-        video_path = cam_saved  # prioriza la última grabación
+        video_path = cam_saved
 
 # ============================================================
-# Metadatos y preparación + Ejecución con progreso
+# Análisis con progreso — INFERENCIA → FEATURES → ML → SUGERENCIAS
 # ============================================================
-def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.ndarray:
-    out = frame.copy()
-    h, w = out.shape[:2]
-    backend = (result_data or {}).get("backend", "")
-    data = (result_data or {}).get("data", {})
-    try:
-        if backend == "mediapipe":
-            kps0 = (data.get("keypoints") or [])
-            if kps0:
-                kps = kps0[0].get("pose") or []
-                for (xn, yn, sc) in kps:
-                    x = int(xn * w); y = int(yn * h)
-                    cv2.circle(out, (x, y), 3, (0, 200, 0), -1)
-        elif backend == "yolo":
-            det0 = (data.get("detections") or [])
-            if det0:
-                first = det0[0]
-                for obj in first:
-                    if "boxes" in obj:
-                        bxs = obj.get("boxes")
-                        if isinstance(bxs, list) and len(bxs) > 0:
-                            for rect in bxs:
-                                if len(rect) >= 4:
-                                    x1, y1, x2, y2 = map(int, rect[:4])
-                                    cv2.rectangle(out, (x1, y1), (x2, y2), (60, 60, 240), 2)
-                    if "keypoints" in obj:
-                        pts = obj.get("keypoints") or []
-                        for pt in pts:
-                            if isinstance(pt, list) and len(pt) >= 2:
-                                x, y = int(pt[0]), int(pt[1])
-                                cv2.circle(out, (x, y), 3, (0, 200, 255), -1)
-    except Exception:
-        pass
-    return out
-
-
-if video_path:
+def _run_pipeline(video_path: str):
     meta = _probe_video(video_path)
     if not meta.get("ok"):
         st.error(f"No se pudo leer el vídeo: {meta.get('reason')}")
         st.stop()
 
-    fps = meta["fps"]
-    total_frames = meta["total_frames"]
-    dur = meta["duration_s"]
-    width, height = meta["width"], meta["height"]
+    fps = meta["fps"]; total_frames = meta["total_frames"]
+    dur = meta["duration_s"]; width, height = meta["width"], meta["height"]
 
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     cols = st.columns(4)
@@ -570,120 +601,129 @@ if video_path:
     st.markdown("</div>", unsafe_allow_html=True)
 
     frames_by_minutes = _estimate_frames_for_minutes(fps, target_minutes)
-    if manual_max_frames:
-        max_frames_to_process = int(max_frames_manual_value)
-    else:
-        max_frames_to_process = int(min(frames_by_minutes, total_frames))
+    max_frames_to_process = int(max_frames_manual_value) if manual_max_frames else int(min(frames_by_minutes, total_frames))
+    st.markdown(f"**Se analizarán ~{max_frames_to_process} frames** (≈ {_nice_time(max_frames_to_process / (fps or 25))}).")
 
-    st.markdown(
-        f"**Se analizarán ~{max_frames_to_process} frames** "
-        f"(≈ {_nice_time(max_frames_to_process / (fps or 25))})."
+    progress = st.progress(0)
+    status_box = st.empty()
+
+    # ① INFERENCIA CV
+    status_box.info("① Extrayendo frames y ejecutando inferencia (pose/detecciones)…")
+    progress.progress(10)
+    results: Dict[str, Any] = run_inference_over_video(
+        video_path,
+        backend=backend,
+        max_frames=max_frames_to_process,
+        yolo_model_path=yolo_model_path,
+    )
+    if not results.get("available", True):
+        st.warning(
+            f"El backend `{results.get('backend')}` no está disponible. "
+            f"Detalle: {results.get('data', {}).get('reason', '—')}"
+        )
+    progress.progress(40)
+
+    # Vista previa + overlay
+    try:
+        cap = cv2.VideoCapture(video_path)
+        ret, frame0 = cap.read(); cap.release()
+        if ret and frame0 is not None:
+            over = _draw_quick_overlay(frame0, results)
+            over_rgb = cv2.cvtColor(over, cv2.COLOR_BGR2RGB)
+            st.image(over_rgb, caption="Vista previa (frame 0 con overlay)", use_container_width=True)
+    except Exception:
+        pass
+
+    # ② FEATURES
+    status_box.info("② Calculando rasgos de movimiento (feature engineering)…")
+    feats: Dict[str, float] = compute_features(results)
+    progress.progress(65)
+
+    # ③ PREDICCIÓN ML — complete_model_thersholder
+    status_box.info("③ Ejecutando modelo ML `complete_model_thersholder` (umbralado por clase)…")
+    labels, scores, prob_map = [], [], {}
+    model_ok = True
+    try:
+        labels, scores, prob_map = predict_with_complete_model_thersholder(feats, artifacts_dir=artifacts_dir)
+    except Exception as e:
+        model_ok = False
+        st.error("No fue posible ejecutar el modelo `complete_model_thersholder`.")
+        st.code("".join(traceback.format_exception_only(type(e), e)))
+    progress.progress(80)
+
+    # ④ SUGERENCIAS
+    status_box.info("④ Generando **sugerencias coreográficas**…")
+    suggestions = _fallback_generate_suggestions(feats, labels, scores)
+    progress.progress(95)
+
+    # ⑤ SALIDA
+    status_box.success("⑤ ¡Listo! Análisis finalizado.")
+    progress.progress(100)
+    st.success(f"✅ Backend: **{results.get('backend')}** · Frames analizados: **{results.get('n_frames')}**")
+
+    colA, colB = st.columns([1, 1], gap="large")
+
+    with colA:
+        st.subheader("Etiquetas y puntuaciones (modelo)")
+        if model_ok and labels:
+            lbltbl = [{"label": l, "score": round(float(s), 3)} for l, s in zip(labels, scores)]
+            st.table(lbltbl)
+        elif not model_ok:
+            st.info("Se omitieron etiquetas del modelo por incidencia. Revisa artifacts y versiones.")
+        else:
+            st.write("—")
+
+        st.subheader("Probabilidades por clase")
+        if prob_map:
+            st.json({k: round(float(v), 4) for k, v in prob_map.items()}, expanded=False)
+        else:
+            st.write("—")
+
+        st.subheader("Rasgos (features)")
+        st.json({k: float(v) for k, v in feats.items()}, expanded=False)
+
+    with colB:
+        st.subheader("💡 Sugerencias coreográficas")
+        if not suggestions:
+            st.info("No se generaron sugerencias (verifica que hay landmarks detectados).")
+        else:
+            for sug in suggestions:
+                st.markdown(
+                    f"<div class='sugg'>"
+                    f"<h4>• {sug.get('title','Sugerencia')}</h4>"
+                    f"<div class='why'><b>Motivo:</b> {sug.get('why','')}</div>"
+                    f"<div><b>Cómo aplicarlo:</b> {sug.get('how','')}</div>"
+                    f"<div class='small'>Severidad: <span class='badge'>{sug.get('severity','—')}</span></div>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+    export = {
+        "video": os.path.basename(results.get("video_path", "")),
+        "backend": results.get("backend"),
+        "n_frames": results.get("n_frames"),
+        "features": feats,
+        "labels": labels,
+        "scores": [float(s) for s in scores],
+        "probs": prob_map,
+        "suggestions": suggestions,
+    }
+    st.download_button(
+        "⬇️ Descargar reporte (JSON)",
+        data=json.dumps(export, ensure_ascii=False, indent=2),
+        file_name="reporte_coreografico.json",
+        mime="application/json",
     )
 
-    run = st.button("🚀 Ejecutar análisis")
-    if run:
-        progress = st.progress(0)
-        status_box = st.empty()
+    with st.expander("📦 Ver JSON bruto de inferencia"):
+        st.json(results, expanded=False)
 
-        try:
-            # 1) INFERENCIA CV
-            status_box.info("① Extrayendo frames y ejecutando inferencia de pose/detecciones…")
-            progress.progress(10)
-            results: Dict[str, Any] = run_inference_over_video(
-                video_path,
-                backend=backend,
-                max_frames=max_frames_to_process,
-                yolo_model_path=yolo_model_path,
-            )
-            if not results.get("available", True):
-                st.warning(
-                    f"El backend `{results.get('backend')}` no está disponible. "
-                    f"Detalle: {results.get('data', {}).get('reason', '—')}"
-                )
-            progress.progress(40)
 
-            # Vista previa
-            try:
-                cap = cv2.VideoCapture(video_path)
-                ret, frame0 = cap.read()
-                cap.release()
-                if ret and frame0 is not None:
-                    over = _draw_quick_overlay(frame0, results)
-                    over_rgb = cv2.cvtColor(over, cv2.COLOR_BGR2RGB)
-                    st.image(over_rgb, caption="Vista previa (frame 0 con overlay)", use_container_width=True)
-            except Exception:
-                pass
-
-            # 2) FEATURES
-            status_box.info("② Calculando rasgos de movimiento (feature engineering)…")
-            feats: Dict[str, float] = compute_features(results)
-            progress.progress(65)
-
-            # 3) PREDICCIÓN
-            status_box.info("③ Predicción de etiquetas coreográficas…")
-            labels, scores = predict_labels(feats, artifacts_dir=artifacts_dir)
-            progress.progress(80)
-
-            # 4) SUGERENCIAS
-            status_box.info("④ Generando **sugerencias coreográficas**…")
-            suggestions = generate_suggestions(feats, labels, scores)
-            progress.progress(95)
-
-            # 5) SALIDA
-            status_box.success("⑤ ¡Listo! Análisis finalizado.")
-            progress.progress(100)
-            st.success(f"✅ Backend: **{results.get('backend')}** · Frames analizados: **{results.get('n_frames')}**")
-
-            colA, colB = st.columns([1, 1])
-            with colA:
-                st.subheader("Etiquetas y puntuaciones")
-                if labels:
-                    lbltbl = [{"label": l, "score": round(float(s), 3)} for l, s in zip(labels, scores)]
-                    st.table(lbltbl)
-                else:
-                    st.write("—")
-
-                st.subheader("Rasgos (features)")
-                st.json({k: float(v) for k, v in feats.items()}, expanded=False)
-
-            with colB:
-                st.subheader("💡 Sugerencias coreográficas")
-                if not suggestions:
-                    st.info("No se generaron sugerencias (comprueba que hay landmarks detectados).")
-                else:
-                    for sug in suggestions:
-                        st.markdown(
-                            f"<div class='sugg'>"
-                            f"<h4>• {sug.get('title','Sugerencia')}</h4>"
-                            f"<div class='why'><b>Motivo:</b> {sug.get('why','')}</div>"
-                            f"<div><b>Cómo aplicarlo:</b> {sug.get('how','')}</div>"
-                            f"<div class='small'>Severidad: <span class='badge'>{sug.get('severity','—')}</span></div>"
-                            f"</div>",
-                            unsafe_allow_html=True
-                        )
-
-            export = {
-                "video": os.path.basename(results.get("video_path", "")),
-                "backend": results.get("backend"),
-                "n_frames": results.get("n_frames"),
-                "features": feats,
-                "labels": labels,
-                "scores": [float(s) for s in scores],
-                "suggestions": suggestions,
-            }
-            st.download_button(
-                "⬇️ Descargar reporte (JSON)",
-                data=json.dumps(export, ensure_ascii=False, indent=2),
-                file_name="reporte_coreografico.json",
-                mime="application/json",
-            )
-
-            with st.expander("📦 Ver JSON bruto de inferencia"):
-                st.json(results, expanded=False)
-
-        except Exception as e:
-            progress.progress(0)
-            status_box.error("❌ Ocurrió un error durante el análisis.")
-            st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+# ============================================================
+# Lanzador
+# ============================================================
+if video_path:
+    if st.button("🚀 Ejecutar análisis"):
+        _run_pipeline(video_path)
 else:
     st.info("📌 Sube un vídeo o graba un clip para comenzar.")

@@ -1,14 +1,21 @@
-
 [server]
 headless = true
 enableCORS = false
+runOnSave = true
 enableXsrfProtection = true
-port = 8501
+maxUploadSize = 1024  # MB
+
+[browser]
+gatherUsageStats = false
 
 [theme]
-base="dark"
-primaryColor="#E27D60"
-backgroundColor="#0E1117"
-secondaryBackgroundColor="#262730"
-textColor="#FAFAFA"
-font="sans serif"
+base = "light"  # "dark" si lo prefieres
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#0F172A"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
