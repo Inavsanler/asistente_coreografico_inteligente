@@ -5,7 +5,6 @@
 from __future__ import annotations
 import os, json, base64, pickle, traceback, tempfile, importlib.util, io
 from typing import Dict, Any, Optional, List, Tuple
-from datetime import timedelta
 
 import numpy as np
 import streamlit as st
@@ -32,7 +31,7 @@ html, body, [class*="css"]  { font-family: 'Inter', system-ui, -apple-system, Se
 .thumb{border-radius:8px;border:1px solid #e5e7eb}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
 .hr{height:1px;background:#e5e7eb;margin:.75rem 0}
-.caption{color:var(--mut);font-size:.85rem}
+.caption{color:#6b7280;font-size:.85rem}
 .stDownloadButton>button{border-radius:10px}
 </style>
 """, unsafe_allow_html=True)
@@ -219,7 +218,7 @@ def timeseries_metrics(K: Optional[np.ndarray]) -> Dict[str, float]:
             diffs.append(np.nanmean(da))
     M["left_right_imbalance"] = float(np.std(diffs)) if diffs else 0.0
 
-    # Devuelve también series auxiliares para keyframes (opcional)
+    # Auxiliares para keyframes
     M["_aux_speed"] = speed
     M["_aux_dirs"]  = np.arctan2(disp[:,1], disp[:,0]) if disp.size else np.array([])
     return M
@@ -273,7 +272,7 @@ def _load_model_and_meta(artifacts_dir: str):
     if isinstance(cn, list): meta["classes"] = [str(x) for x in cn]
     th = _load_json_if_exists(os.path.join(artifacts_dir, "thresholds.json"))
     if isinstance(th, dict):
-        # Asegura floats aunque vengan como dicts anidados del Colab
+        # robustez por si vienen dicts anidados desde Colab
         def _safe_float(v, default=0.5):
             try:
                 if isinstance(v,(int,float,np.integer,np.floating)): return float(v)
@@ -335,7 +334,7 @@ def predict_with_model(features: Dict[str,float], artifacts_dir: str="artifacts"
     if model is None:
         raise RuntimeError("No se encontró un modelo en artifacts/ (p.ej., complete_model_thresholded_bundle.joblib).")
 
-    X, feat_keys = _vectorize(features, meta.get("feature_order"))
+    X, _ = _vectorize(features, meta.get("feature_order"))
     classes = _get_model_classes(model, meta)
     nC = len(classes)
 
@@ -386,19 +385,16 @@ def predict_with_model(features: Dict[str,float], artifacts_dir: str="artifacts"
             else:
                 for i in range(min(nC, probs.shape[1])):
                     prob_map[classes[i]] = float(probs[0, i])
-                # Rellena si faltan
                 for i in range(probs.shape[1], nC):
                     prob_map[classes[i]] = 0.0
         else:
             for i, c in enumerate(classes):
                 prob_map[c] = float(probs[0, i])
     else:
-        # Asegura estructura como en el Colab: todas las clases con 0.0
         for c in classes: prob_map[c] = 0.0
 
     th = _get_thresholds(classes, meta, default=0.5)
     labels, scores = [], []
-    # Siempre produce alguna etiqueta (como fallback del Colab)
     for c in classes:
         p = prob_map.get(c,0.0)
         if p >= th.get(c,0.5):
@@ -410,8 +406,66 @@ def predict_with_model(features: Dict[str,float], artifacts_dir: str="artifacts"
     return labels, [float(s) for s in scores], prob_map, model_path
 
 # ============================================================
-# Sugerencias (con referencia temporal)
+# Sugerencias (con referencia temporal y mapa desde el notebook)
 # ============================================================
+LABEL_TO_TEXT_FALLBACK = {
+    "amplitud_baja":      "Aumentar amplitud (extensiones y desplazamientos más amplios).",
+    "variedad_baja":      "Introducir cambios de dirección y diagonales.",
+    "mucha_simetria":     "Explorar asimetrías entre izquierda y derecha.",
+    "poca_simetria":      "Equilibrar con momentos de simetría.",
+    "fluidez_baja":       "Trabajar transiciones para mayor continuidad/fluidez.",
+    "poco_rango_niveles": "Usar niveles alto y bajo además del medio.",
+}
+
+def _load_label_text_map(artifacts_dir: str) -> dict:
+    """Carga mapa etiqueta→texto entrenado como en tu Colab."""
+    # 1) suggestions.json (opcional)
+    sjson = os.path.join(artifacts_dir, "suggestions.json")
+    if os.path.exists(sjson):
+        try:
+            obj = json.load(open(sjson, "r", encoding="utf-8"))
+            if isinstance(obj, dict) and obj:
+                return {str(k): str(v) for k,v in obj.items()}
+        except Exception:
+            pass
+    # 2) label_names.csv (si existe) → construye mapa con fallback
+    ln = os.path.join(artifacts_dir, "label_names.csv")
+    if os.path.exists(ln):
+        try:
+            import csv
+            with open(ln, "r", encoding="utf-8") as f:
+                names = [row[0] for row in csv.reader(f) if row]
+            auto = {}
+            for name in names:
+                auto[name] = LABEL_TO_TEXT_FALLBACK.get(name, f"Aplicar pauta entrenada para «{name.replace('_',' ')}».")
+            return auto
+        except Exception:
+            pass
+    # 3) Fallback extraído del notebook
+    return LABEL_TO_TEXT_FALLBACK.copy()
+
+def _suggestions_from_labels(labels: List[str], scores: List[float], label_text_map: dict, frame_times: List[float], speed: np.ndarray) -> List[Dict[str,Any]]:
+    out=[]
+    def _time_from_speed():
+        if speed is None or (isinstance(speed,np.ndarray) and speed.size==0) or not frame_times:
+            return frame_times[len(frame_times)//2] if frame_times else 0.0
+        peaks = np.where((speed[1:-1] > speed[:-2]) & (speed[1:-1] > speed[2:]))[0] + 1
+        idx = int(peaks[0]) if len(peaks) else int(np.argmax(speed))
+        idx = max(0, min(idx, len(frame_times)-1))
+        return float(frame_times[idx])
+    tref = _time_from_speed()
+    for l, sc in zip(labels, scores):
+        txt = label_text_map.get(str(l))
+        if not txt: continue
+        out.append({
+            "title": str(l).replace("_"," ").capitalize(),
+            "severity":"media",
+            "why": f"Etiqueta del modelo: {l} (score {float(sc):.2f}).",
+            "how": txt,
+            "t": float(tref)
+        })
+    return out
+
 def generate_suggestions(features: Dict[str,float], labels: List[str], scores: List[float],
                          M: Dict[str,float], frame_times: List[float]) -> List[Dict[str,Any]]:
     s: List[Dict[str,Any]] = []
@@ -420,7 +474,6 @@ def generate_suggestions(features: Dict[str,float], labels: List[str], scores: L
     vel = features.get("velocidad_media",0.0)
     varD = features.get("variedad_direcciones",0.0)
     nivel = features.get("nivel_rango",0.0)
-    sim = features.get("simetria",0.0)
 
     pause = M.get("pause_ratio",0.0)
     jerk  = M.get("jerk_mean",0.0)
@@ -430,8 +483,9 @@ def generate_suggestions(features: Dict[str,float], labels: List[str], scores: L
     tempo = M.get("tempo_cv",1.0)
     speed = M.get("_aux_speed", np.array([]))
 
-    def _time_ref_from_speed(criteria: str) -> float:
-        if speed.size < 3: return frame_times[len(frame_times)//2] if frame_times else 0.0
+    def _time_ref(criteria: str) -> float:
+        if speed is None or (isinstance(speed,np.ndarray) and speed.size==0) or not frame_times:
+            return frame_times[len(frame_times)//2] if frame_times else 0.0
         if criteria == "pausa":
             idx = int(np.argmin(speed))
         elif criteria == "acento":
@@ -444,89 +498,80 @@ def generate_suggestions(features: Dict[str,float], labels: List[str], scores: L
         idx = max(0, min(idx, len(frame_times)-1))
         return float(frame_times[idx])
 
-    # --- Reglas con referencias temporales
+    # Reglas genéricas (coherentes con métricas/feats que calculas en Colab)
     if max(ax,ay) < 60:
         s.append({"title":"Aumenta amplitud espacial","severity":"media",
                   "why":f"Amplitud baja (x≈{ax:.1f}, y≈{ay:.1f}).",
                   "how":"Introduce diagonales amplias y transiciones entre niveles alto/medio/bajo.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
     if vel < 1.5:
         s.append({"title":"Proyección dinámica","severity":"media",
                   "why":f"Velocidad media baja ({vel:.2f}).",
                   "how":"Acentos y aceleraciones puntuales en 8+8 para crear contraste.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
     if varD < 0.25:
         s.append({"title":"Explora direcciones","severity":"baja",
                   "why":f"Variedad direccional limitada ({varD:.2f}).",
                   "how":"Secuencia de giros y cambios de foco entre frontal/diagonales.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
     if nivel > -20:
         s.append({"title":"Trabaja niveles","severity":"baja",
                   "why":f"Rango vertical escaso ({nivel:.1f}).",
                   "how":"Incluye plié y bajadas al suelo para ampliar el rango.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
 
     if pause > 0.25:
         s.append({"title":"Rellena silencios de movimiento","severity":"media",
                   "why":f"Tiempo en pausa {pause*100:.0f}%.",
                   "how":"Usa micro-transiciones entre frases (desplazamientos cortos, respiración activa).",
-                  "t": _time_ref_from_speed("pausa")})
+                  "t": _time_ref("pausa")})
     if jerk > 0.35:
         s.append({"title":"Suaviza transiciones","severity":"media",
                   "why":f"Jerk medio alto ({jerk:.2f}).",
                   "how":"Añade curvas en trayectorias y anticipos de peso antes de cambios bruscos.",
-                  "t": _time_ref_from_speed("irregular")})
+                  "t": _time_ref("irregular")})
     if turnR < 0.10:
         s.append({"title":"Introduce más cambios de dirección","severity":"baja",
                   "why":f"Pocos giros marcados (rate {turnR:.2f}).",
                   "how":"Inserta pivots ¼-½ vuelta en remates intermedios.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
     if expV < 0.20:
         s.append({"title":"Varía tamaños corporales","severity":"baja",
                   "why":f"Baja variación de expansión (CV {expV:.2f}).",
                   "how":"Alterna gestos recogidos vs. extendidos cada 2 frases.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
     if lrimb > 5.0:
         s.append({"title":"Equilibra lateralidad","severity":"media",
                   "why":f"Desequilibrio izq-der ({lrimb:.1f}).",
                   "how":"Duplica la frase en espejo o alterna entradas por ambos lados.",
-                  "t": _time_ref_from_speed("acento")})
+                  "t": _time_ref("acento")})
     if tempo > 0.35:
         s.append({"title":"Regular el pulso","severity":"media",
                   "why":f"Tempo irregular (CV {tempo:.2f}).",
                   "how":"Trabaja con metrónomo en 8+8 y fija acentos constantes.",
-                  "t": _time_ref_from_speed("irregular")})
+                  "t": _time_ref("irregular")})
 
-    for l, sc in zip(labels, scores):
-        if "Energía Alta" in str(l):
-            s.append({"title":"Controla la inercia en cambios","severity":"baja",
-                      "why":f"Etiqueta {l} (score {sc:.2f}).",
-                      "how":"Añade medio tiempo de sostén tras diagonales rápidas.",
-                      "t": _time_ref_from_speed("acento")})
-        if "Energía Baja" in str(l):
-            s.append({"title":"Amplía port de bras","severity":"media",
-                      "why":f"Etiqueta {l} (score {sc:.2f}).",
-                      "how":"Rango mayor en brazos y proyección torácica.",
-                      "t": _time_ref_from_speed("acento")})
-        if "Fluidez" in str(l) and M.get("jerk_mean",0.0) > 0.25:
-            s.append({"title":"Consolidar fluidez","severity":"baja",
-                      "why":f"Etiqueta {l} pero jerk {M.get('jerk_mean',0.0):.2f}.",
-                      "how":"Conecta transiciones con trayectorias curvas y continuidad de peso.",
-                      "t": _time_ref_from_speed("irregular")})
+    # Sugerencias aprendidas desde el modelo (texto del notebook / artifacts)
+    label_text_map = globals().get("_LABEL_TEXT_MAP_RUNTIME", {})
+    s += _suggestions_from_labels(labels, scores, label_text_map, frame_times, speed)
 
+    # Remate útil
     s.append({"title":"Clarifica remates","severity":"baja",
               "why":"Mejora la legibilidad de las frases.",
               "how":"Pausa de ¼ tiempo y foco final en cada frase.",
-              "t": _time_ref_from_speed("acento")})
+              "t": _time_ref("acento")})
     return s
 
 # ============================================================
-# Keyframes (selección + render con esqueleto)
+# Keyframes (selección + render con esqueleto e IDs)
 # ============================================================
 _SKELETON_PAIRS = [(5,7),(7,9),(6,8),(8,10),(11,13),(13,15),(12,14),(14,16),(5,6),(11,12)]
+_PAIR_COLOR = (60,60,240)    # líneas
+_DOT_COLOR  = (0,200,255)    # puntos
+_ID_COLOR   = (20,20,20)     # texto índice
 
 def _pick_keyframes(K: np.ndarray, frame_indices: np.ndarray, max_k: int = 12) -> List[int]:
-    """Heurística: picos de velocidad, mínimos (pausas), variación direccional; relleno uniforme."""
+    """Heurística: picos de velocidad, mínimos (pausas), cambios de dirección; relleno uniforme."""
     if K is None or not np.isfinite(K).any() or K.shape[0] == 0:
         return list(frame_indices[:max_k])
 
@@ -536,37 +581,37 @@ def _pick_keyframes(K: np.ndarray, frame_indices: np.ndarray, max_k: int = 12) -
     dirs  = np.arctan2(disp[:,1], disp[:,0]) if disp.size else np.zeros(0)
     cand = set()
 
-    # picos de velocidad
     if speed.size >= 3:
         peaks = np.where((speed[1:-1] > speed[:-2]) & (speed[1:-1] > speed[2:]))[0] + 1
         for p in peaks[:max_k//3]: cand.add(int(p))
-    # pausas (mínimos)
     if speed.size:
         mins = np.argsort(speed)[:max(1, max_k//4)]
         for m in mins: cand.add(int(m))
-    # cambios bruscos de dirección
     if dirs.size >= 2:
         turn = np.abs(np.diff(dirs))
         top_turn = np.argsort(-turn)[:max(1, max_k//4)]
         for t in top_turn: cand.add(int(t+1))
 
-    # relleno uniforme si faltan
     while len(cand) < min(max_k, len(frame_indices)):
         cand.add(int(np.linspace(0, len(frame_indices)-1, num=min(max_k, len(frame_indices)), dtype=int)[len(cand)]))
 
     idx_list = sorted(list(cand))[:max_k]
-    # mapear índices relativos (dentro de K) a índices absolutos del vídeo
     return [int(frame_indices[i]) for i in idx_list if 0 <= i < len(frame_indices)]
 
-def _draw_pose_on_frame(frame: np.ndarray, P: np.ndarray) -> np.ndarray:
+def _draw_pose_on_frame(frame: np.ndarray, P: np.ndarray, show_ids: bool=True, highlight_pairs: bool=True) -> np.ndarray:
     fr = frame.copy()
-    if P is not None and P.shape[0] >= 17:
+    if P is None or P.shape[0] < 17:
+        return fr
+    if highlight_pairs:
         for a,b in _SKELETON_PAIRS:
             if a<P.shape[0] and b<P.shape[0] and np.all(np.isfinite(P[a,:2])) and np.all(np.isfinite(P[b,:2])):
-                cv2.line(fr, (int(P[a,0]),int(P[a,1])), (int(P[b,0]),int(P[b,1])), (60,60,240), 2)
-        for j in range(min(P.shape[0],17)):
-            x,y = P[j,:2]
-            if np.isfinite(x) and np.isfinite(y): cv2.circle(fr, (int(x),int(y)), 2, (0,200,255), -1)
+                cv2.line(fr, (int(P[a,0]),int(P[a,1])), (int(P[b,0]),int(P[b,1])), _PAIR_COLOR, 2)
+    for j in range(min(P.shape[0],17)):
+        x,y = P[j,:2]
+        if np.isfinite(x) and np.isfinite(y):
+            cv2.circle(fr, (int(x),int(y)), 3, _DOT_COLOR, -1)
+            if show_ids:
+                cv2.putText(fr, str(j), (int(x)+5, int(y)-5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, _ID_COLOR, 1, cv2.LINE_AA)
     return fr
 
 def _grab_frames(video_path: str, abs_indices: List[int]) -> List[np.ndarray]:
@@ -576,8 +621,7 @@ def _grab_frames(video_path: str, abs_indices: List[int]) -> List[np.ndarray]:
     for idx in abs_indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
         ok, fr = cap.read()
-        if ok and fr is not None: out.append(fr)
-        else: out.append(None)
+        out.append(fr if ok and fr is not None else None)
     cap.release()
     return out
 
@@ -588,7 +632,7 @@ def _b64_img_rgb(img: np.ndarray, quality: int = 85) -> str:
     return base64.b64encode(buf.tobytes()).decode("utf-8")
 
 # ============================================================
-# Cámara HTML5 (igual, sin dependencias externas)
+# Cámara HTML5 (grabación simple)
 # ============================================================
 def _camera_recorder_html_ui() -> Optional[str]:
     html = """
@@ -661,9 +705,11 @@ target_minutes = st.sidebar.slider("Minutos a analizar (desde el inicio)", 0.5, 
 manual_max_frames = st.sidebar.checkbox("Fijar máx. frames manual", value=False)
 max_frames_manual_value = st.sidebar.number_input("Máx. frames", min_value=10, max_value=20000, value=600, step=10)
 overlay_pose = st.sidebar.checkbox("Sobreponer esqueleto en miniaturas", value=True)
+show_kp_ids  = st.sidebar.checkbox("Mostrar índices de keypoints (0–16)", value=True)
+highlight_pairs = st.sidebar.checkbox("Resaltar pares simétricos", value=True)
 artifacts_dir = st.sidebar.text_input("Carpeta de artifacts", "artifacts")
 st.sidebar.info("Modelo esperado: **complete_model_thresholded_bundle.joblib** (o .pkl) en `artifacts/`.\n"
-                "Opcional: `feature_order.json`, `class_names.json`, `thresholds.json`.")
+                "Opcional: `feature_order.json`, `class_names.json`, `thresholds.json`, `label_names.csv`, `suggestions.json`.")
 
 tab_upload, tab_camera = st.tabs(["📤 Subir vídeo", "🎥 Grabar con cámara (HTML5)"])
 video_path: Optional[str] = None
@@ -680,7 +726,7 @@ with tab_camera:
 # Pipeline
 # ============================================================
 def _run_pipeline(video_path: str):
-    # Meta del vídeo
+    # Metadata del vídeo
     meta = _probe_video(video_path)
     if not meta.get("ok"): st.error(f"No se pudo leer el vídeo: {meta.get('reason')}"); st.stop()
     fps, total = meta["fps"], meta["total_frames"]
@@ -694,7 +740,7 @@ def _run_pipeline(video_path: str):
     c[3].markdown(f"<div class='kpi'>Resolución</div><div class='small'>{W}×{H}</div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Límite real de frames según minutos o manual
+    # Límite real de frames
     frames_by_minutes = _estimate_frames_for_minutes(fps, target_minutes)
     max_frames = int(max_frames_manual_value) if manual_max_frames else int(min(frames_by_minutes, total))
     sel_indices = _frame_indices_for_limit(total, max_frames)
@@ -743,12 +789,15 @@ def _run_pipeline(video_path: str):
         model_ok = False; labels=[]; scores=[]; prob_map={}
         st.error("No fue posible ejecutar el modelo (¿archivo no encontrado o incompatible?).")
         st.code("".join(traceback.format_exception_only(type(e), e)))
-        # Garantiza estructura como en Colab
+        # Estructura mínima
         prob_map = {"Clase_0":0.0,"Clase_1":0.0}
     progress.progress(88)
 
-    # ④ Sugerencias con refs temporales
+    # ④ Sugerencias con refs temporales (incluye las del modelo entrenado)
     status.info("④ Generando sugerencias…")
+    # Carga mapa label->texto desde artifacts (o fallback del notebook)
+    global _LABEL_TEXT_MAP_RUNTIME
+    _LABEL_TEXT_MAP_RUNTIME = _load_label_text_map(artifacts_dir)
     suggestions = generate_suggestions(feats, labels, scores, metr, frame_times)
     progress.progress(94)
 
@@ -758,21 +807,17 @@ def _run_pipeline(video_path: str):
         key_abs_indices = _pick_keyframes(Kf, t_indices_used, max_k=12)
         raw_frames = _grab_frames(video_path, key_abs_indices)
         thumbs_b64: Dict[int,str] = {}
-        pose_by_abs: Dict[int, np.ndarray] = {}
-
-        # mapa abs_index -> índice relativo en Kf (para dibujar pose correspondiente)
+        # mapa abs_index -> índice relativo en Kf
         rel_map = {abs_i: int(np.where(t_indices_used==abs_i)[0][0]) for abs_i in key_abs_indices if abs_i in t_indices_used}
         for abs_i, fr in zip(key_abs_indices, raw_frames):
             if fr is None: continue
             P = Kf[rel_map[abs_i]] if Kf is not None and rel_map.get(abs_i, None) is not None else None
-            img = _draw_pose_on_frame(fr, P) if overlay_pose else fr
+            img = _draw_pose_on_frame(fr, P, show_ids=show_kp_ids, highlight_pairs=highlight_pairs) if overlay_pose else fr
             thumbs_b64[abs_i] = _b64_img_rgb(img, quality=85)
-            pose_by_abs[abs_i] = P
     else:
         key_abs_indices = list(t_indices_used[:12])
         raw_frames = _grab_frames(video_path, key_abs_indices)
         thumbs_b64 = {abs_i: _b64_img_rgb(fr, quality=85) for abs_i, fr in zip(key_abs_indices, raw_frames) if fr is not None}
-        pose_by_abs = {}
 
     # Relaciona cada sugerencia con el fotograma más cercano a su timecode
     def _closest_abs_index(t_sec: float) -> Optional[int]:
@@ -813,7 +858,7 @@ def _run_pipeline(video_path: str):
         st.json({k: float(v) for k, v in feats.items()}, expanded=False)
 
         st.subheader("Métricas temporales")
-        metr_show = {k: float(v) for k, v in metr.items() if not k.startswith("_aux")}
+        metr_show = {k: float(v) for k, v in metr.items() if not str(k).startswith("_aux")}
         st.json(metr_show, expanded=False)
 
     with colB:
@@ -864,7 +909,7 @@ def _run_pipeline(video_path: str):
         "scores": [float(s) for s in scores],
         "probs": {k: float(v) for k,v in (prob_map or {}).items()},
         "suggestions": [
-            {k: (v if k not in ("thumb_b64",) else None) for k, v in sg.items()}  # quita imagen en JSON
+            {k: (v if k not in ("thumb_b64",) else None) for k, v in sg.items()}  # sin imagen en JSON
             for sg in suggestions
         ],
         "model_file": os.path.basename(model_path) if model_ok and model_path else None,
@@ -875,7 +920,7 @@ def _run_pipeline(video_path: str):
     }
 
     st.download_button(
-        "⬇️ Descargar reporte ",
+        "⬇️ Descargar reporte (JSON)",
         data=json.dumps(export, ensure_ascii=False, indent=2),
         file_name="reporte_coreografico.json",
         mime="application/json",
@@ -934,7 +979,7 @@ def _run_pipeline(video_path: str):
         <table><tbody>""" + "".join([f"<tr><td>{esc(k)}</td><td>{float(v):.4f}</td></tr>" for k,v in feats.items()]) + """</tbody></table>
 
         <h2>Métricas temporales</h2>
-        <table><tbody>""" + "".join([f"<tr><td>{esc(k)}</td><td>{float(v):.4f}</td></tr>" for k,v in metr.items() if not k.startswith("_aux")]) + """</tbody></table>
+        <table><tbody>""" + "".join([f"<tr><td>{esc(k)}</td><td>{float(v):.4f}</td></tr>" for k,v in metr_show.items()]) + """</tbody></table>
 
         <h2>Sugerencias coreográficas (con timecode)</h2>
         """ + sugg_html + """
@@ -942,7 +987,7 @@ def _run_pipeline(video_path: str):
         <h2>Fotogramas clave</h2>
         """ + grid_html + """
 
-        <div class="mut" style="margin-top:12px">Modelo: """ + (esc(os.path.basename(model_path)) if model_ok and model_path else "—") + """</div>
+        <div class="mut" style="margin-top:12px">Modelo: """ + (os.path.basename(model_path) if model_ok and model_path else "—") + """</div>
         </body></html>"""
         return html.encode("utf-8")
 
@@ -958,7 +1003,7 @@ def _run_pipeline(video_path: str):
 # Lanzador
 # ============================================================
 if video_path:
-    if st.button("🚀 Ejecutar análisis "):
+    if st.button("🚀 Ejecutar análisis (modo Colab)"):
         _run_pipeline(video_path)
 else:
     st.info("📌 Sube un vídeo o graba un clip para comenzar.")
