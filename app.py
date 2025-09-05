@@ -1,23 +1,22 @@
 # ============================================================
-# app.py — Asistente Coreográfico Inteligente (Progresión + Sugerencias)
+# app.py — Asistente Coreográfico Inteligente (Upload + Cámara HTML5)
 # ============================================================
 
 from __future__ import annotations
 
 import os
-import io
-import sys
 import json
-import math
-import time
+import base64
 import traceback
 import tempfile
+import importlib.util
 from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import cv2
-from PIL import Image
+from PIL import Image  # noqa: F401
 
 # -------------------------------
 # Configuración de la página
@@ -44,6 +43,7 @@ st.markdown(
 .sugg{border-left:4px solid var(--acc);padding:.5rem .75rem;margin:.35rem 0;border-radius:8px;background:#f8fafc}
 .sugg h4{margin:.2rem 0 .15rem 0;font-size:1rem}
 .sugg .why{color:#6b7280;font-size:.9rem}
+.note{font-size:.9rem;color:#6b7280}
 </style>
 """,
     unsafe_allow_html=True,
@@ -53,7 +53,7 @@ st.markdown(
 # IMPORT ROBUSTO DEL MOTOR DE INFERENCIA
 # ============================================================
 try:
-    from src.inference import run_inference_over_video  # ← nuestro orquestador de CV
+    from src.inference import run_inference_over_video
 except SyntaxError as e:
     st.error("Hay un **error de sintaxis** en `src/inference.py`. Revísalo. Detalle en logs.")
     st.code("".join(traceback.format_exception_only(type(e), e)))
@@ -64,44 +64,44 @@ except Exception as e:
     raise
 
 # ============================================================
-# IMPORTS OPCIONALES (del proyecto Colab / repo original)
-# Si existen, se usarán; si no, hay fallbacks internos
+# IMPORTS OPCIONALES (proyecto Colab / repo original) — SEGUROS
 # ============================================================
-_features_fn = None
-_predict_fn = None
-_suggestions_fn = None
+_features_fn: Optional[callable] = None
+_predict_fn: Optional[callable] = None
+_suggestions_fn: Optional[callable] = None
 
-try:
-    # Ejemplos esperados por el proyecto original (ajústalo si tus nombres difieren)
-    # 1) ingeniería de características
+# 1) features
+if importlib.util.find_spec("src.features") is not None:
     try:
-        from src.features import compute_features_from_inference as _features_fn  # noqa
+        from src.features import compute_features_from_inference as _features_fn  # type: ignore
     except Exception:
-        from src.features import extract_features as _features_fn  # noqa
-    # 2) predicción ML
-    try:
-        from src.model import predict_labels as _predict_fn  # noqa
-    except Exception:
-        pass
-    # 3) generador de sugerencias
-    try:
-        from src.suggestions import generate_suggestions as _suggestions_fn  # noqa
-    except Exception:
-        from src.rules import generate_suggestions as _suggestions_fn  # noqa
-except Exception:
-    # Si algo falla, tiramos de fallbacks internos más abajo
-    pass
+        try:
+            from src.features import extract_features as _features_fn  # type: ignore
+        except Exception:
+            _features_fn = None
 
+# 2) predicción ML
+if importlib.util.find_spec("src.model") is not None:
+    try:
+        from src.model import predict_labels as _predict_fn  # type: ignore
+    except Exception:
+        _predict_fn = None
+
+# 3) sugerencias
+if importlib.util.find_spec("src.suggestions") is not None:
+    try:
+        from src.suggestions import generate_suggestions as _suggestions_fn  # type: ignore
+    except Exception:
+        _suggestions_fn = None
 
 # ============================================================
-# UTILIDADES LOCALES
+# UTILIDADES
 # ============================================================
 def _save_uploaded_video_to_tmp(upload) -> str:
-    """Guarda un archivo subido/capturado en un temporal y devuelve la ruta."""
     suffix = ".mp4"
     if hasattr(upload, "name") and isinstance(upload.name, str):
         name = upload.name.lower()
-        for ext in (".mp4", ".mov", ".avi", ".mkv"):
+        for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
             if name.endswith(ext):
                 suffix = ext
                 break
@@ -109,7 +109,7 @@ def _save_uploaded_video_to_tmp(upload) -> str:
     if hasattr(upload, "read"):
         tmp.write(upload.read())
     else:
-        tmp.write(upload.getvalue())  # st.camera_input
+        tmp.write(upload.getvalue())
     tmp.flush()
     return tmp.name
 
@@ -148,28 +148,15 @@ def _estimate_frames_for_minutes(fps: float, minutes: float) -> int:
     return int(round(minutes * 60.0 * fps))
 
 
-# ============================================================
-# FALLBACKS INTERNOS (por si no existen tus módulos)
-# ============================================================
+# ---------------- Fallbacks (por si no hay módulos del repo) ----------------
 def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Extrae métricas simples de movimiento a partir del diccionario devuelto por run_inference_over_video.
-    Funciona con mediapipe (norm coords) o yolo (px).
-    Devuelve:
-      - motion_intensity
-      - vertical_amplitude
-      - lateral_drift
-      - tempo_irregularity
-    """
     backend = (inf or {}).get("backend", "")
     data = (inf or {}).get("data", {})
     n_frames = max(1, int(inf.get("n_frames", 0)))
-
-    # Recolectar lista de keypoints por frame como np.array NxKx2 (x,y)
     keypoints_per_frame: List[np.ndarray] = []
 
     if backend == "mediapipe":
-        frames = data.get("keypoints") or []  # lista de dicts: {"pose": [(xnorm,ynorm,score), ...]}
+        frames = data.get("keypoints") or []
         for fr in frames:
             pts = fr.get("pose") or []
             if not pts:
@@ -177,11 +164,9 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
                 continue
             arr = np.array([(p[0], p[1]) for p in pts if isinstance(p, (list, tuple)) and len(p) >= 2], dtype=float)
             keypoints_per_frame.append(arr)
-
     elif backend == "yolo":
-        frames = data.get("detections") or []  # lista por frame: [ { "keypoints": [[x,y],...], ...}, ... ]
+        frames = data.get("detections") or []
         for fr in frames:
-            # si hay varias detecciones, cogemos la primera con keypoints
             pts = None
             for obj in fr:
                 if "keypoints" in obj and obj["keypoints"]:
@@ -193,12 +178,9 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
                 arr = np.array([[p[0], p[1]] for p in pts if isinstance(p, (list, tuple)) and len(p) >= 2], dtype=float)
                 keypoints_per_frame.append(arr)
 
-    # Asegurar longitud consistente
     if not keypoints_per_frame:
         keypoints_per_frame = [np.zeros((0, 2), dtype=float) for _ in range(n_frames)]
 
-    # Métricas
-    # 1) Intensidad de movimiento: desplazamiento promedio por landmark y frame
     disps = []
     for i in range(1, len(keypoints_per_frame)):
         a = keypoints_per_frame[i - 1]
@@ -208,7 +190,6 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
             disps.append(float(d))
     motion_intensity = float(np.mean(disps)) if disps else 0.0
 
-    # 2) Amplitud vertical: rango vertical medio (por frame)
     ranges = []
     for a in keypoints_per_frame:
         if a.size > 0:
@@ -216,14 +197,12 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
             ranges.append(rng)
     vertical_amplitude = float(np.mean(ranges)) if ranges else 0.0
 
-    # 3) Deriva lateral: varianza del centro x a lo largo del tiempo
     centers_x = []
     for a in keypoints_per_frame:
         if a.size > 0:
             centers_x.append(float(a[:, 0].mean()))
     lateral_drift = float(np.std(centers_x)) if len(centers_x) >= 2 else 0.0
 
-    # 4) Irregularidad de tempo: desviación sobre la diferencia entre desplazamientos consecutivos
     tempo_irreg = 0.0
     if len(disps) >= 3:
         deltas = np.diff(disps)
@@ -238,17 +217,12 @@ def _fallback_compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
 
 
 def _fallback_predict_labels(features: Dict[str, float], artifacts_dir: str = "artifacts") -> Tuple[List[str], List[float]]:
-    """
-    Predicción mínima si no hay modelo: clasifica heurísticamente tres etiquetas.
-    """
     mi = features.get("motion_intensity", 0.0)
     va = features.get("vertical_amplitude", 0.0)
     ld = features.get("lateral_drift", 0.0)
     ti = features.get("tempo_irregularity", 0.0)
 
     labels, scores = [], []
-
-    # Ejemplo heurístico: "Energia Alta/Media/Baja"
     if mi > 8e-2:       labels.append("Energía Alta");  scores.append(min(0.99, mi))
     elif mi > 3e-2:     labels.append("Energía Media"); scores.append(min(0.8, mi + 0.1))
     else:               labels.append("Energía Baja");   scores.append(min(0.7, 0.5 - mi))
@@ -271,71 +245,32 @@ def _fallback_generate_suggestions(
     labels: List[str],
     scores: List[float]
 ) -> List[Dict[str, Any]]:
-    """
-    Genera sugerencias coreográficas en lenguaje natural a partir de rasgos simples.
-    """
     s = []
-
     mi = features.get("motion_intensity", 0.0)
     va = features.get("vertical_amplitude", 0.0)
     ld = features.get("lateral_drift", 0.0)
     ti = features.get("tempo_irregularity", 0.0)
 
-    # Amplitud / Energía
     if "Energía Baja" in labels or mi < 3e-2:
-        s.append({
-            "title": "Incrementa la proyección y la amplitud de brazos",
-            "severity": "media",
-            "why": f"Intensidad de movimiento estimada {mi:.3f} — inferior al umbral recomendado.",
-            "how": "Amplía el rango de hombros y caderas en las frases de transición; marca un acento claro en la salida y cierre de port de bras.",
-        })
+        s.append({"title":"Incrementa la proyección y la amplitud de brazos","severity":"media",
+                  "why":f"Intensidad {mi:.3f} — baja.","how":"Amplía rango en port de bras; acentúa salidas/cierres."})
     elif "Energía Alta" in labels:
-        s.append({
-            "title": "Controla la inercia en los cambios de dirección",
-            "severity": "baja",
-            "why": f"Intensidad de movimiento estimada {mi:.3f} — buena proyección.",
-            "how": "Añade medio tiempo de sostén tras diagonales rápidas para afianzar el equilibrio en el eje.",
-        })
-
-    # Verticalidad / Centro
+        s.append({"title":"Controla la inercia en cambios de dirección","severity":"baja",
+                  "why":f"Intensidad {mi:.3f} — buena proyección.","how":"Añade medio tiempo de sostén tras diagonales."})
     if va < 3e-2:
-        s.append({
-            "title": "Mayor elasticidad vertical",
-            "severity": "media",
-            "why": f"Amplitud vertical {va:.3f} — limitada.",
-            "how": "Introduce variaciones de altura: plié–demi–gran en transiciones; alterna planos alto/medio/bajo en ocho tiempos.",
-        })
-
-    # Eje y deriva
+        s.append({"title":"Mayor elasticidad vertical","severity":"media",
+                  "why":f"Amplitud vertical {va:.3f} — limitada.","how":"Introduce variaciones plié–demi–gran y planos alto/medio/bajo."})
     if ld > 6e-2:
-        s.append({
-            "title": "Reafirma el eje en giros y desplazamientos",
-            "severity": "alta",
-            "why": f"Deriva lateral {ld:.3f} — indica oscilación del centro.",
-            "how": "Ensaya diagonales con foco frontal fijo y contrapeso en escápulas; usa marcas de suelo para trazar líneas limpias.",
-        })
-
-    # Musicalidad
+        s.append({"title":"Reafirma el eje en giros y desplazamientos","severity":"alta",
+                  "why":f"Deriva lateral {ld:.3f}.","how":"Foco frontal fijo; contrapeso en escápulas; marcas de suelo."})
     if ti > 2e-2:
-        s.append({
-            "title": "Regular el pulso entre frases",
-            "severity": "media",
-            "why": f"Irregularidad de tempo {ti:.3f}.",
-            "how": "Trabaja con metrónomo en 8+8, manteniendo homogeneidad en entradas y cierres; sincroniza respiración con acentos musicales.",
-        })
-
-    # Siempre añadimos una sugerencia “de calidad”
-    s.append({
-        "title": "Clarifica intenciones en los remates",
-        "severity": "baja",
-        "why": "La legibilidad gestual mejora la recepción del público.",
-        "how": "Define el foco y la dirección de mirada en los compases finales; reserva 1/4 de tiempo para 'presentar' el gesto.",
-    })
-
+        s.append({"title":"Regular el pulso entre frases","severity":"media",
+                  "why":f"Irregularidad de tempo {ti:.3f}.","how":"Metrónomo en 8+8; sincroniza respiración con acentos."})
+    s.append({"title":"Clarifica intenciones en remates","severity":"baja",
+              "why":"Mejora la legibilidad gestual.","how":"Define foco y mirada en compases finales; 1/4 de tiempo para presentar el gesto."})
     return s
 
 
-# Wrappers que priorizan tus módulos si existen
 def compute_features(inf: Dict[str, Any]) -> Dict[str, float]:
     if _features_fn is not None:
         try:
@@ -368,15 +303,13 @@ def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.nd
     h, w = out.shape[:2]
     backend = (result_data or {}).get("backend", "")
     data = (result_data or {}).get("data", {})
-
     try:
         if backend == "mediapipe":
             kps0 = (data.get("keypoints") or [])
             if kps0:
                 kps = kps0[0].get("pose") or []
                 for (xn, yn, sc) in kps:
-                    x = int(xn * w)
-                    y = int(yn * h)
+                    x = int(xn * w); y = int(yn * h)
                     cv2.circle(out, (x, y), 3, (0, 200, 0), -1)
         elif backend == "yolo":
             det0 = (data.get("detections") or [])
@@ -402,10 +335,142 @@ def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.nd
 
 
 # ============================================================
+# Cámara HTML5: grabar vídeo sin dependencias extra
+# ============================================================
+def _camera_recorder_html_ui() -> Optional[str]:
+    """
+    Devuelve una ruta temporal a un vídeo grabado con la cámara (si el usuario pulsa "Usar clip").
+    Implementado con MediaRecorder en un componente HTML (sin streamlit-webrtc ni av).
+    """
+    html = """
+    <div style="font-family:system-ui,Segoe UI,Roboto,Arial">
+      <video id="preview" autoplay playsinline style="width:100%;max-height:260px;background:#000;border-radius:12px"></video>
+      <div style="margin:.5rem 0;display:flex;gap:.5rem;flex-wrap:wrap">
+        <button id="startBtn">⏺️ Comenzar</button>
+        <button id="stopBtn" disabled>⏹️ Detener</button>
+        <button id="useBtn" disabled>💾 Usar clip</button>
+        <label style="margin-left:auto">Duración máx. (s):
+          <input id="maxSec" type="number" min="5" max="60" value="15" style="width:4rem">
+        </label>
+        <label style="margin-left:.5rem">FPS:
+          <input id="fps" type="number" min="10" max="30" value="24" style="width:4rem">
+        </label>
+      </div>
+      <div id="note" style="color:#6b7280;font-size:.9rem">Si el navegador pide permisos, acéptalos. El clip se grabará en <b>WebM</b>.</div>
+      <script>
+        const video = document.getElementById('preview');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const useBtn = document.getElementById('useBtn');
+        const maxSec = document.getElementById('maxSec');
+        const fps = document.getElementById('fps');
+
+        let mediaStream = null;
+        let mediaRecorder = null;
+        let chunks = [];
+        let timer = null;
+
+        function postValue(val){
+          const msg = { type: 'streamlit:setComponentValue', value: val };
+          window.parent.postMessage(msg, '*');
+        }
+        function componentReady(){
+          const msg = { type: 'streamlit:componentReady', value: true };
+          window.parent.postMessage(msg, '*');
+        }
+        componentReady();
+
+        async function initCamera(){
+          if (mediaStream) return;
+          try{
+            mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            video.srcObject = mediaStream;
+          }catch(e){
+            document.getElementById('note').innerText = 'No se pudo acceder a la cámara: ' + e;
+          }
+        }
+        initCamera();
+
+        startBtn.onclick = () => {
+          if (!mediaStream){ return; }
+          chunks = [];
+          let mime = 'video/webm;codecs=vp9';
+          if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
+          if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+          try{
+            mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime });
+          }catch(e){
+            document.getElementById('note').innerText = 'MediaRecorder no soportado en este navegador.';
+            return;
+          }
+          mediaRecorder.ondataavailable = ev => { if (ev.data && ev.data.size > 0) chunks.push(ev.data); };
+          mediaRecorder.onstop = () => { stopBtn.disabled = true; useBtn.disabled = chunks.length === 0; };
+          mediaRecorder.start(Math.max(1000 / parseInt(fps.value||'24'), 200));
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+          useBtn.disabled = true;
+
+          const limit = parseInt(maxSec.value || '15');
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(()=>{ try{ mediaRecorder.stop(); }catch{} }, limit*1000);
+        };
+
+        stopBtn.onclick = () => {
+          try{ mediaRecorder && mediaRecorder.stop(); }catch{}
+          startBtn.disabled = false;
+          stopBtn.disabled = true;
+        };
+
+        useBtn.onclick = async () => {
+          if (chunks.length === 0) return;
+          const blob = new Blob(chunks, { type: 'video/webm' });
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const dataUrl = reader.result; // data:video/webm;base64,AAA...
+            postValue(dataUrl);
+          };
+          reader.readAsDataURL(blob);
+        };
+
+        // Habilitar el botón usar clip al finalizar
+        const observer = new MutationObserver(()=>{});
+        observer.observe(document.body, {subtree:true,childList:true});
+
+        // Activar/desactivar según eventos
+        video.onplaying = ()=>{};
+        video.onpause = ()=>{};
+        // Inicial
+        useBtn.disabled = true;
+      </script>
+    </div>
+    """
+    data_url = components.html(html, height=420, scrolling=False)
+    if isinstance(data_url, str) and data_url.startswith("data:video/"):
+        # Guardar a archivo temporal
+        header, b64 = data_url.split(",", 1)
+        ext = ".webm"
+        if "mp4" in header:
+            ext = ".mp4"
+        tmp_path = tempfile.NamedTemporaryFile(delete=False, suffix=ext).name
+        with open(tmp_path, "wb") as f:
+            f.write(base64.b64decode(b64))
+        st.success(f"✅ Clip guardado: {os.path.basename(tmp_path)}")
+        st.video(tmp_path)
+        return tmp_path
+    return None
+
+
+# ============================================================
 # UI — Encabezado
 # ============================================================
 st.markdown("<div class='main-header'>🎭 Asistente Coreográfico Inteligente</div>", unsafe_allow_html=True)
-st.write("Análisis con progresión visible y **sugerencias coreográficas**. El sistema usa tus módulos del proyecto si están disponibles; si no, aplica un motor de reglas interno para no dejarte sin feedback.")
+st.write("Analiza vídeos de danza (subidos o **grabados desde tu cámara** sin dependencias extra) y recibe **sugerencias coreográficas**.")
+
+# Avisos de fallback (opcionales)
+if _predict_fn is None:
+    st.caption("⚠️ Predicción ML: usando heurística interna (no se encontró `src.model`).")
+if _suggestions_fn is None:
+    st.caption("⚠️ Sugerencias: generador interno por reglas (no se encontró `src.suggestions`).")
 
 # ============================================================
 # Sidebar — Configuración
@@ -415,9 +480,9 @@ st.sidebar.header("⚙️ Configuración")
 backend = st.sidebar.selectbox("Backend de visión", ["mediapipe", "yolo"], index=0)
 yolo_model_path = st.sidebar.text_input("Ruta del modelo YOLO (si aplica)", "artifacts/yolo.pt")
 
-with st.sidebar.expander("⏱️ Duración a analizar"):
-    target_minutes = st.slider("Minutos (inicio del vídeo)", 0.5, 5.0, 3.0, 0.5)
-    st.caption("Consejo: 3–5 minutos. El sistema recorta del inicio.")
+with st.sidebar.expander("⏱️ Duración a analizar (del inicio)"):
+    target_minutes = st.slider("Minutos", 0.5, 5.0, 3.0, 0.5)
+    st.caption("Consejo: 3–5 minutos. Se recorta desde el inicio del vídeo.")
 
 with st.sidebar.expander("⚙️ Avanzado"):
     manual_max_frames = st.checkbox("Fijar manualmente máx. de frames", value=False)
@@ -425,25 +490,66 @@ with st.sidebar.expander("⚙️ Avanzado"):
     artifacts_dir = st.text_input("Carpeta de artifacts (bundle, CSV, modelos)", "artifacts")
 
 st.sidebar.markdown("---")
-st.sidebar.info("Asegúrate de que `src/__init__.py` existe. Si tienes `src/features.py`, `src/model.py` y `src/suggestions.py`, se usarán automáticamente.")
+st.sidebar.info("Si tienes `src/features.py`, `src/model.py`, `src/suggestions.py`, se usarán automáticamente.")
 
 # ============================================================
-# Carga de vídeo
+# Entrada de vídeo: Upload o Cámara HTML5
 # ============================================================
-col_up1, col_up2 = st.columns(2)
-with col_up1:
-    up_video = st.file_uploader("📤 Sube un vídeo (mp4/mov/avi/mkv)", type=["mp4", "mov", "avi", "mkv"])
-with col_up2:
-    cam_video = st.camera_input("🎥 O graba con tu cámara")
+tab_upload, tab_camera = st.tabs(["📤 Subir vídeo", "🎥 Grabar con cámara (HTML5)"])
 
 video_path: Optional[str] = None
-if up_video or cam_video:
-    video_path = _save_uploaded_video_to_tmp(up_video or cam_video)
-    st.video(video_path)
+
+with tab_upload:
+    up_video = st.file_uploader("Sube un vídeo (mp4/mov/avi/mkv/webm)", type=["mp4", "mov", "avi", "mkv", "webm"])
+    if up_video:
+        video_path = _save_uploaded_video_to_tmp(up_video)
+        st.video(video_path)
+
+with tab_camera:
+    st.markdown("Graba un **clip de vídeo** desde tu cámara (HTML5/MediaRecorder) y úsalo directamente en el análisis.")
+    cam_saved = _camera_recorder_html_ui()
+    if cam_saved:
+        video_path = cam_saved  # prioriza la última grabación
 
 # ============================================================
-# Metadatos y preparación
+# Metadatos y preparación + Ejecución con progreso
 # ============================================================
+def _draw_quick_overlay(frame: np.ndarray, result_data: Dict[str, Any]) -> np.ndarray:
+    out = frame.copy()
+    h, w = out.shape[:2]
+    backend = (result_data or {}).get("backend", "")
+    data = (result_data or {}).get("data", {})
+    try:
+        if backend == "mediapipe":
+            kps0 = (data.get("keypoints") or [])
+            if kps0:
+                kps = kps0[0].get("pose") or []
+                for (xn, yn, sc) in kps:
+                    x = int(xn * w); y = int(yn * h)
+                    cv2.circle(out, (x, y), 3, (0, 200, 0), -1)
+        elif backend == "yolo":
+            det0 = (data.get("detections") or [])
+            if det0:
+                first = det0[0]
+                for obj in first:
+                    if "boxes" in obj:
+                        bxs = obj.get("boxes")
+                        if isinstance(bxs, list) and len(bxs) > 0:
+                            for rect in bxs:
+                                if len(rect) >= 4:
+                                    x1, y1, x2, y2 = map(int, rect[:4])
+                                    cv2.rectangle(out, (x1, y1), (x2, y2), (60, 60, 240), 2)
+                    if "keypoints" in obj:
+                        pts = obj.get("keypoints") or []
+                        for pt in pts:
+                            if isinstance(pt, list) and len(pt) >= 2:
+                                x, y = int(pt[0]), int(pt[1])
+                                cv2.circle(out, (x, y), 3, (0, 200, 255), -1)
+    except Exception:
+        pass
+    return out
+
+
 if video_path:
     meta = _probe_video(video_path)
     if not meta.get("ok"):
@@ -474,9 +580,6 @@ if video_path:
         f"(≈ {_nice_time(max_frames_to_process / (fps or 25))})."
     )
 
-    # ========================================================
-    # EJECUCIÓN CON PROGRESIÓN VISIBLE
-    # ========================================================
     run = st.button("🚀 Ejecutar análisis")
     if run:
         progress = st.progress(0)
@@ -516,22 +619,21 @@ if video_path:
             feats: Dict[str, float] = compute_features(results)
             progress.progress(65)
 
-            # 3) PREDICCIÓN (ML si existe, si no heurístico)
+            # 3) PREDICCIÓN
             status_box.info("③ Predicción de etiquetas coreográficas…")
             labels, scores = predict_labels(feats, artifacts_dir=artifacts_dir)
             progress.progress(80)
 
-            # 4) SUGERENCIAS (NLP)
+            # 4) SUGERENCIAS
             status_box.info("④ Generando **sugerencias coreográficas**…")
             suggestions = generate_suggestions(feats, labels, scores)
             progress.progress(95)
 
-            # 5) SALIDA + EXPORTS
+            # 5) SALIDA
             status_box.success("⑤ ¡Listo! Análisis finalizado.")
             progress.progress(100)
             st.success(f"✅ Backend: **{results.get('backend')}** · Frames analizados: **{results.get('n_frames')}**")
 
-            # Bloque de resultados
             colA, colB = st.columns([1, 1])
             with colA:
                 st.subheader("Etiquetas y puntuaciones")
@@ -560,7 +662,6 @@ if video_path:
                             unsafe_allow_html=True
                         )
 
-            # Exportables
             export = {
                 "video": os.path.basename(results.get("video_path", "")),
                 "backend": results.get("backend"),
@@ -585,4 +686,4 @@ if video_path:
             status_box.error("❌ Ocurrió un error durante el análisis.")
             st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)))
 else:
-    st.info("📌 Sube un vídeo o usa la cámara para comenzar.")
+    st.info("📌 Sube un vídeo o graba un clip para comenzar.")
