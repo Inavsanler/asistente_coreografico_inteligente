@@ -1003,7 +1003,7 @@ def _run_pipeline(video_path: str):
 # Lanzador
 # ============================================================
 if video_path:
-    if st.button("🚀 Ejecutar análisis (modo Colab)"):
+    if st.button("🚀 Ejecutar análisis "):
         _run_pipeline(video_path)
 else:
     st.info("📌 Sube un vídeo o graba un clip para comenzar.")
