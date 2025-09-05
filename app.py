@@ -3,7 +3,7 @@
 # ============================================================
 
 from __future__ import annotations
-import os, json, base64, pickle, traceback, tempfile, importlib.util, io
+import os, json, base64, pickle, traceback, tempfile
 from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
@@ -70,7 +70,7 @@ def _estimate_frames_for_minutes(fps: float, minutes: float) -> int:
     return int(round((fps if fps>0 else 25.0) * 60.0 * minutes))
 
 def _frame_indices_for_limit(total_frames: int, target_count: int) -> np.ndarray:
-    """Devuelve índices aproximadamente equiespaciados para limitar el coste."""
+    """Índices equiespaciados para limitar el coste."""
     target_count = max(1, min(target_count, total_frames))
     return np.linspace(0, total_frames-1, num=target_count, dtype=int)
 
@@ -224,47 +224,171 @@ def timeseries_metrics(K: Optional[np.ndarray]) -> Dict[str, float]:
     return M
 
 # ============================================================
-# Modelo (auto-detección; prioriza thresholded_bundle)
+# Modelo: clases/probabilidades robustas (alineado con Colab)
 # ============================================================
-def _load_json_if_exists(path: str):
+def _unwrap_final_estimator(est):
+    """Si es Pipeline/GridSearch/etc., devuelve el estimador final que tiene predict_proba/classes_."""
     try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f: return json.load(f)
+        from sklearn.pipeline import Pipeline  # noqa: F401
     except Exception:
         pass
-    return None
+    # 1) Pipeline
+    if hasattr(est, "steps") and isinstance(getattr(est, "steps"), list) and len(est.steps):
+        return est.steps[-1][1]
+    # 2) named_steps
+    if hasattr(est, "named_steps"):
+        try:
+            steps = list(est.named_steps.values())
+            if steps: return steps[-1]
+        except Exception:
+            pass
+    # 3) GridSearchCV-like
+    if hasattr(est, "best_estimator_"):
+        return _unwrap_final_estimator(est.best_estimator_)
+    return est
 
-def _find_model_file(artifacts_dir: str) -> Optional[str]:
-    pref = [
-        "complete_model_thresholded_bundle.joblib",
-        "complete_model_thresholded_bundle.pkl",
-        "complete_model_thresholded.joblib",
-        "complete_model_thresholded.pkl",
-        "complete_model_threshold.joblib",
-        "complete_model_threshold.pkl",
-    ]
-    for n in pref:
-        p = os.path.join(artifacts_dir, n)
-        if os.path.exists(p): return p
-    for f in os.listdir(artifacts_dir or "."):
-        if f.lower().endswith((".joblib",".pkl")): return os.path.join(artifacts_dir, f)
-    return None
+def _discover_classes(model, meta: Dict[str,Any]) -> List[str]:
+    if isinstance(meta.get("classes"), list) and meta["classes"]:
+        return [str(c) for c in meta["classes"]]
+    cand = getattr(model, "classes_", None)
+    if cand is not None and len(cand):
+        return [str(c) for c in list(cand)]
+    est = _unwrap_final_estimator(model)
+    cand = getattr(est, "classes_", None)
+    if cand is not None and len(cand):
+        return [str(c) for c in list(cand)]
+    return ["Clase_0", "Clase_1"]
 
-def _load_model_and_meta(artifacts_dir: str):
-    path = _find_model_file(artifacts_dir)
+def _to_numpy(x):
+    """Convierte pandas/series/listas a np.ndarray."""
+    try:
+        import pandas as pd
+        if isinstance(x, (pd.DataFrame, pd.Series)):
+            return x.to_numpy()
+    except Exception:
+        pass
+    try:
+        return np.asarray(x)
+    except Exception:
+        return None
+
+def _normalize_probs_output(raw, nC: int, classes: List[str]):
+    """
+    Normaliza distintas formas a np.ndarray shape (1, nC) en el orden de 'classes'.
+    Acepta: ndarray (1,nC)|(1,2), lista de (1,2) por clase, dict {class: p}, DataFrame/Series.
+    """
+    # dict {class: prob}
+    if isinstance(raw, dict):
+        arr = np.zeros((1, nC), dtype=float)
+        for i, c in enumerate(classes):
+            v = raw.get(c, 0.0)
+            try:
+                v = float(v[0]) if (isinstance(v, (list, tuple, np.ndarray)) and len(v)>0) else float(v)
+            except Exception:
+                v = 0.0
+            arr[0, i] = v
+        return arr
+
+    A = _to_numpy(raw)
+    if A is None:
+        return None
+    A = np.asarray(A)
+
+    # Lista de arrays (multilabel típico: [(1,2), (1,2), ...])
+    if isinstance(raw, (list, tuple)) and len(raw) and hasattr(raw[0], "shape"):
+        cols = []
+        for p in raw:
+            p = _to_numpy(p)
+            if p is None: continue
+            p = np.asarray(p)
+            if p.ndim == 2 and p.shape[1] == 2:
+                cols.append(p[:,1])          # prob positiva
+            elif p.ndim == 1:
+                cols.append(p)
+            else:
+                e = np.exp(p - np.max(p, axis=-1, keepdims=True))
+                sm = e / (np.sum(e, axis=-1, keepdims=True) + 1e-8)
+                cols.append(sm[:, -1])
+        if cols:
+            M = np.stack(cols, axis=1)
+            if M.shape[1] != nC:
+                out = np.zeros((M.shape[0], nC), dtype=float)
+                for i in range(min(nC, M.shape[1])): out[:, i] = M[:, i]
+                return out
+            return M
+
+    # Array clásico
+    if A.ndim == 1:
+        A = A.reshape(1, -1)
+    if A.shape[1] == 2 and nC == 2:
+        return A
+    if A.shape[1] == 2 and nC == 1:
+        return A[:,1:].reshape(1,1)
+    if A.shape[1] != nC:
+        out = np.zeros((A.shape[0], nC), dtype=float)
+        for i in range(min(nC, A.shape[1])): out[:, i] = A[:, i]
+        return out
+    return A
+
+def _get_thresholds(classes: List[str], meta: Dict[str,Any], default: float=0.5) -> Dict[str,float]:
+    out = {c: default for c in classes}
+    if isinstance(meta.get("thresholds"), dict):
+        for c,v in meta["thresholds"].items():
+            try: out[str(c)] = float(v)
+            except Exception: pass
+    return out
+
+def predict_with_model(features: Dict[str,float], artifacts_dir: str="artifacts"
+) -> Tuple[List[str], List[float], Dict[str,float], Optional[str]]:
+    """
+    Devuelve:
+      - labels: etiquetas activadas por umbral (o top-1)
+      - scores: puntuaciones correspondientes
+      - prob_map: {clase: prob} para TODAS las clases
+      - model_path
+    """
+    # Carga modelo + meta
+    def _load_json_if_exists(path: str):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f: return json.load(f)
+        except Exception:
+            pass
+        return None
+
+    def _find_model_file(artifacts_dir: str) -> Optional[str]:
+        pref = [
+            "complete_model_thresholded_bundle.joblib",
+            "complete_model_thresholded_bundle.pkl",
+            "complete_model_thresholded.joblib",
+            "complete_model_thresholded.pkl",
+            "complete_model_threshold.joblib",
+            "complete_model_threshold.pkl",
+        ]
+        for n in pref:
+            p = os.path.join(artifacts_dir, n)
+            if os.path.exists(p): return p
+        for f in os.listdir(artifacts_dir or "."):
+            if f.lower().endswith((".joblib",".pkl")): return os.path.join(artifacts_dir, f)
+        return None
+
+    model_path = _find_model_file(artifacts_dir)
     model = None
-    if path and path.lower().endswith(".joblib"):
+    if model_path and model_path.lower().endswith(".joblib"):
         try:
-            import joblib; model = joblib.load(path)
+            import joblib; model = joblib.load(model_path)
         except Exception as e:
-            st.error(f"No se pudo cargar `{os.path.basename(path)}` (joblib).")
+            st.error(f"No se pudo cargar `{os.path.basename(model_path)}` (joblib).")
             st.code("".join(traceback.format_exception_only(type(e), e)))
-    elif path and path.lower().endswith(".pkl"):
+    elif model_path and model_path.lower().endswith(".pkl"):
         try:
-            with open(path, "rb") as f: model = pickle.load(f)
+            with open(model_path, "rb") as f: model = pickle.load(f)
         except Exception as e:
-            st.error(f"No se pudo cargar `{os.path.basename(path)}` (pickle).")
+            st.error(f"No se pudo cargar `{os.path.basename(model_path)}` (pickle).")
             st.code("".join(traceback.format_exception_only(type(e), e)))
+    if model is None:
+        raise RuntimeError("No se encontró un modelo en artifacts/.")
+
     meta: Dict[str, Any] = {}
     fo = _load_json_if_exists(os.path.join(artifacts_dir, "feature_order.json"))
     if isinstance(fo, list): meta["feature_order"] = [str(x) for x in fo]
@@ -272,7 +396,6 @@ def _load_model_and_meta(artifacts_dir: str):
     if isinstance(cn, list): meta["classes"] = [str(x) for x in cn]
     th = _load_json_if_exists(os.path.join(artifacts_dir, "thresholds.json"))
     if isinstance(th, dict):
-        # robustez por si vienen dicts anidados desde Colab
         def _safe_float(v, default=0.5):
             try:
                 if isinstance(v,(int,float,np.integer,np.floating)): return float(v)
@@ -284,123 +407,111 @@ def _load_model_and_meta(artifacts_dir: str):
             except Exception:
                 return float(default)
         meta["thresholds"] = {str(k): _safe_float(v) for k, v in th.items()}
-    return model, meta, path
 
-def _vectorize(features: Dict[str,float], feature_order: Optional[List[str]]) -> Tuple[np.ndarray, List[str]]:
-    if feature_order:
-        keys = list(feature_order)
-    else:
-        prefer = ['amplitud_x','amplitud_y','amplitud_z','velocidad_media','simetria','nivel_rango','variedad_direcciones','frames']
-        keys = [k for k in prefer if k in features] + [k for k in sorted(features.keys()) if k not in prefer]
-    X = np.array([[float(features.get(k,0.0)) for k in keys]], dtype=np.float64)
-    return X, keys
-
-def _get_model_classes(model, meta: Dict[str,Any]) -> List[str]:
-    if isinstance(meta.get("classes"), list) and meta["classes"]:
-        return [str(c) for c in meta["classes"]]
-    classes = getattr(getattr(model,"named_steps",model), "classes_", None) or getattr(model,"classes_", None)
-    if classes is not None and len(classes): return [str(c) for c in list(classes)]
-    return ["Clase_0","Clase_1"]
-
-def _get_thresholds(classes: List[str], meta: Dict[str,Any], default: float=0.5) -> Dict[str,float]:
-    out = {c: default for c in classes}
-    if isinstance(meta.get("thresholds"), dict):
-        for c,v in meta["thresholds"].items():
-            try: out[str(c)] = float(v)
-            except Exception: pass
-    return out
-
-def _proba_from_list(probs_list, n_classes: int) -> Optional[np.ndarray]:
-    try:
-        arrs = []
-        for p in probs_list:
-            p = np.asarray(p)
-            if p.ndim == 2 and p.shape[1] == 2:
-                arrs.append(p[:,1])
-            elif p.ndim == 1:
-                arrs.append(p)
-            else:
-                e = np.exp(p - np.max(p, axis=-1, keepdims=True))
-                sm = e / (np.sum(e, axis=-1, keepdims=True) + 1e-8)
-                if sm.shape[1] >= 2: arrs.append(sm[:,1])
-                else: arrs.append(sm[:,0])
-        return np.stack(arrs, axis=1).reshape(1, n_classes)
-    except Exception:
-        return None
-
-def predict_with_model(features: Dict[str,float], artifacts_dir: str="artifacts"
-) -> Tuple[List[str], List[float], Dict[str,float], Optional[str]]:
-    model, meta, model_path = _load_model_and_meta(artifacts_dir)
-    if model is None:
-        raise RuntimeError("No se encontró un modelo en artifacts/ (p.ej., complete_model_thresholded_bundle.joblib).")
+    # Vectoriza
+    def _vectorize(features: Dict[str,float], feature_order: Optional[List[str]]) -> Tuple[np.ndarray, List[str]]:
+        if feature_order:
+            keys = list(feature_order)
+        else:
+            prefer = ['amplitud_x','amplitud_y','amplitud_z','velocidad_media','simetria','nivel_rango','variedad_direcciones','frames']
+            keys = [k for k in prefer if k in features] + [k for k in sorted(features.keys()) if k not in prefer]
+        X = np.array([[float(features.get(k,0.0)) for k in keys]], dtype=np.float64)
+        return X, keys
 
     X, _ = _vectorize(features, meta.get("feature_order"))
-    classes = _get_model_classes(model, meta)
+    classes = _discover_classes(model, meta)
     nC = len(classes)
 
+    # ==== obtener probabilidades de manera robusta
     probs = None
+    raw = None
+    est = _unwrap_final_estimator(model)
     try:
-        est = model
-        if hasattr(est,"predict_proba"):
-            pr = est.predict_proba(X)
-            if isinstance(pr, list):
-                probs = _proba_from_list(pr, nC)
+        if hasattr(model, "predict_proba"):
+            raw = model.predict_proba(X)
+        elif hasattr(est, "predict_proba"):
+            raw = est.predict_proba(X)
+    except Exception:
+        raw = None
+
+    if raw is not None:
+        probs = _normalize_probs_output(raw, nC, classes)
+
+    # decision_function → sigmoide
+    if probs is None:
+        try:
+            if hasattr(model, "decision_function"):
+                df = _to_numpy(model.decision_function(X))
+            elif hasattr(est, "decision_function"):
+                df = _to_numpy(est.decision_function(X))
             else:
-                pr = np.asarray(pr)
-                if pr.ndim == 2 and pr.shape[1] in (nC, 2):
-                    probs = pr if pr.shape[1] == nC else pr[:,1:].reshape(1,1) if nC==1 else None
-                else:
-                    probs = pr.reshape(1, -1)
-        if probs is None and hasattr(est,"decision_function"):
-            df = est.decision_function(X)
-            df = np.asarray(df)
-            if df.ndim == 1: df = df.reshape(1,-1)
-            probs = 1/(1+np.exp(-df))
-        if probs is None and hasattr(est,"predict"):
-            y = est.predict(X)
-            y = np.asarray(y)
+                df = None
+            if df is not None:
+                if df.ndim == 1: df = df.reshape(1, -1)
+                probs = 1/(1+np.exp(-df))
+                if probs.shape[1] != nC:
+                    probs = _normalize_probs_output(probs, nC, classes)
+        except Exception:
+            probs = None
+
+    # predict_log_proba → exp
+    if probs is None:
+        try:
+            if hasattr(model, "predict_log_proba"):
+                lp = _to_numpy(model.predict_log_proba(X))
+            elif hasattr(est, "predict_log_proba"):
+                lp = _to_numpy(est.predict_log_proba(X))
+            else:
+                lp = None
+            if lp is not None:
+                probs = np.exp(lp)
+                probs = _normalize_probs_output(probs, nC, classes)
+        except Exception:
+            probs = None
+
+    # predict → one-hot (último recurso)
+    if probs is None:
+        try:
+            y = _to_numpy(model.predict(X))
+            if y is None and hasattr(est, "predict"):
+                y = _to_numpy(est.predict(X))
             probs = np.zeros((1, nC), dtype=float)
-            try:
-                if y.ndim==2 and y.shape[1]==nC:
+            if y is not None:
+                if y.ndim == 2 and y.shape[1] == nC:
                     probs = y.astype(float)
                 else:
-                    idx = int(y[0])
-                    if 0<=idx<nC: probs[0, idx] = 1.0
-            except Exception:
-                for i, c in enumerate(classes):
-                    if str(y[0]) == str(c): probs[0, i] = 1.0; break
-    except Exception as e:
-        st.error("No se pudieron obtener puntuaciones del modelo (comprueba versiones sklearn/joblib).")
-        st.code("".join(traceback.format_exception_only(type(e), e)))
-        probs = None
+                    y0 = str(y[0])
+                    try:
+                        idx = int(y0)
+                        if 0 <= idx < nC: probs[0, idx] = 1.0
+                    except Exception:
+                        for i, c in enumerate(classes):
+                            if y0 == str(c):
+                                probs[0, i] = 1.0
+                                break
+        except Exception:
+            probs = None
 
-    if probs is not None and probs.ndim == 1: probs = probs.reshape(1, -1)
+    if probs is None:
+        probs = np.zeros((1, nC), dtype=float)
 
-    prob_map: Dict[str, float] = {}
-    if probs is not None:
-        if probs.shape[1] != nC:
-            if probs.shape[1] == 1 and nC == 2:
-                prob_map[classes[1]] = float(probs[0,0])
-                prob_map[classes[0]] = float(1.0 - probs[0,0])
-            else:
-                for i in range(min(nC, probs.shape[1])):
-                    prob_map[classes[i]] = float(probs[0, i])
-                for i in range(probs.shape[1], nC):
-                    prob_map[classes[i]] = 0.0
-        else:
-            for i, c in enumerate(classes):
-                prob_map[c] = float(probs[0, i])
-    else:
-        for c in classes: prob_map[c] = 0.0
+    if probs.ndim == 1:
+        probs = probs.reshape(1, -1)
+    if probs.shape[1] != nC:
+        P = np.zeros((1, nC), dtype=float)
+        for i in range(min(nC, probs.shape[1])): P[0, i] = float(probs[0, i])
+        probs = P
 
-    th = _get_thresholds(classes, meta, default=0.5)
+    prob_map: Dict[str, float] = {c: float(probs[0, i]) for i, c in enumerate(classes)}
+
+    thresholds = _get_thresholds(classes, meta, default=0.5)
     labels, scores = [], []
     for c in classes:
-        p = prob_map.get(c,0.0)
-        if p >= th.get(c,0.5):
+        p = prob_map.get(c, 0.0)
+        if p >= thresholds.get(c, 0.5):
             labels.append(c); scores.append(p)
     if not labels:
-        best = int(np.argmax([prob_map.get(c,0.0) for c in classes]))
+        best = int(np.argmax([prob_map.get(c, 0.0) for c in classes]))
         labels, scores = [classes[best]], [prob_map[classes[best]]]
 
     return labels, [float(s) for s in scores], prob_map, model_path
@@ -419,7 +530,6 @@ LABEL_TO_TEXT_FALLBACK = {
 
 def _load_label_text_map(artifacts_dir: str) -> dict:
     """Carga mapa etiqueta→texto entrenado como en tu Colab."""
-    # 1) suggestions.json (opcional)
     sjson = os.path.join(artifacts_dir, "suggestions.json")
     if os.path.exists(sjson):
         try:
@@ -428,7 +538,6 @@ def _load_label_text_map(artifacts_dir: str) -> dict:
                 return {str(k): str(v) for k,v in obj.items()}
         except Exception:
             pass
-    # 2) label_names.csv (si existe) → construye mapa con fallback
     ln = os.path.join(artifacts_dir, "label_names.csv")
     if os.path.exists(ln):
         try:
@@ -441,7 +550,6 @@ def _load_label_text_map(artifacts_dir: str) -> dict:
             return auto
         except Exception:
             pass
-    # 3) Fallback extraído del notebook
     return LABEL_TO_TEXT_FALLBACK.copy()
 
 def _suggestions_from_labels(labels: List[str], scores: List[float], label_text_map: dict, frame_times: List[float], speed: np.ndarray) -> List[Dict[str,Any]]:
@@ -498,7 +606,7 @@ def generate_suggestions(features: Dict[str,float], labels: List[str], scores: L
         idx = max(0, min(idx, len(frame_times)-1))
         return float(frame_times[idx])
 
-    # Reglas genéricas (coherentes con métricas/feats que calculas en Colab)
+    # Reglas genéricas (alineadas con el notebook)
     if max(ax,ay) < 60:
         s.append({"title":"Aumenta amplitud espacial","severity":"media",
                   "why":f"Amplitud baja (x≈{ax:.1f}, y≈{ay:.1f}).",
@@ -551,11 +659,11 @@ def generate_suggestions(features: Dict[str,float], labels: List[str], scores: L
                   "how":"Trabaja con metrónomo en 8+8 y fija acentos constantes.",
                   "t": _time_ref("irregular")})
 
-    # Sugerencias aprendidas desde el modelo (texto del notebook / artifacts)
+    # Sugerencias aprendidas (texto del notebook / artifacts)
     label_text_map = globals().get("_LABEL_TEXT_MAP_RUNTIME", {})
     s += _suggestions_from_labels(labels, scores, label_text_map, frame_times, speed)
 
-    # Remate útil
+    # Remate
     s.append({"title":"Clarifica remates","severity":"baja",
               "why":"Mejora la legibilidad de las frases.",
               "how":"Pausa de ¼ tiempo y foco final en cada frase.",
@@ -789,13 +897,11 @@ def _run_pipeline(video_path: str):
         model_ok = False; labels=[]; scores=[]; prob_map={}
         st.error("No fue posible ejecutar el modelo (¿archivo no encontrado o incompatible?).")
         st.code("".join(traceback.format_exception_only(type(e), e)))
-        # Estructura mínima
         prob_map = {"Clase_0":0.0,"Clase_1":0.0}
     progress.progress(88)
 
     # ④ Sugerencias con refs temporales (incluye las del modelo entrenado)
     status.info("④ Generando sugerencias…")
-    # Carga mapa label->texto desde artifacts (o fallback del notebook)
     global _LABEL_TEXT_MAP_RUNTIME
     _LABEL_TEXT_MAP_RUNTIME = _load_label_text_map(artifacts_dir)
     suggestions = generate_suggestions(feats, labels, scores, metr, frame_times)
@@ -807,7 +913,6 @@ def _run_pipeline(video_path: str):
         key_abs_indices = _pick_keyframes(Kf, t_indices_used, max_k=12)
         raw_frames = _grab_frames(video_path, key_abs_indices)
         thumbs_b64: Dict[int,str] = {}
-        # mapa abs_index -> índice relativo en Kf
         rel_map = {abs_i: int(np.where(t_indices_used==abs_i)[0][0]) for abs_i in key_abs_indices if abs_i in t_indices_used}
         for abs_i, fr in zip(key_abs_indices, raw_frames):
             if fr is None: continue
