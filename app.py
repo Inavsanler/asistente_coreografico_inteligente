@@ -875,7 +875,7 @@ def _run_pipeline(video_path: str):
     }
 
     st.download_button(
-        "⬇️ Descargar reporte (JSON)",
+        "⬇️ Descargar reporte ",
         data=json.dumps(export, ensure_ascii=False, indent=2),
         file_name="reporte_coreografico.json",
         mime="application/json",
